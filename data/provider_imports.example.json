@@ -1,0 +1,24 @@
+{
+  "pois": [
+    {
+      "areaId": "mykonos",
+      "type": "hotel",
+      "name": "Example Hotel",
+      "lat": 37.4501,
+      "lng": 25.3302,
+      "aliases": ["example"],
+      "source": "tripadvisor",
+      "url": "https://www.tripadvisor.com/..."
+    },
+    {
+      "areaId": "zakynthos",
+      "type": "beach",
+      "name": "Example Beach",
+      "lat": 37.76,
+      "lng": 20.9,
+      "aliases": ["example bay"],
+      "source": "viator",
+      "url": "https://www.viator.com/..."
+    }
+  ]
+}

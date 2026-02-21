@@ -1,0 +1,22 @@
+{
+  "pois": [
+    {
+      "areaId": "mykonos",
+      "type": "beach_club",
+      "name": "Scorpios",
+      "lat": 37.4138,
+      "lng": 25.3362,
+      "aliases": ["scorpios mykonos"],
+      "source": "curated"
+    },
+    {
+      "areaId": "mykonos",
+      "type": "hotel",
+      "name": "Cavo Tagoo Mykonos",
+      "lat": 37.4613,
+      "lng": 25.3176,
+      "aliases": ["cavo tagoo"],
+      "source": "curated"
+    }
+  ]
+}

@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aegean Voice Call Monitor</title>
+  <style>
+    :root {
+      --bg: #0b1320;
+      --panel: #111d32;
+      --text: #e7eefc;
+      --muted: #98abcf;
+      --line: #213454;
+      --green: #16a34a;
+      --red: #dc2626;
+      --orange: #ea580c;
+      --amber: #d97706;
+      --blue: #2563eb;
+      --purple: #7c3aed;
+      --slate: #64748b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #08101b, #0e1a2c);
+      color: var(--text);
+    }
+    .wrap { max-width: 1400px; margin: 24px auto; padding: 0 18px; }
+    .head {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px;
+    }
+    .controls { display: flex; gap: 8px; align-items: center; }
+    .title { font-size: 24px; font-weight: 700; margin: 0; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .panel {
+      border: 1px solid var(--line);
+      background: rgba(17, 29, 50, 0.88);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      text-align: left; font-size: 12px; color: var(--muted); letter-spacing: .02em;
+      padding: 10px 10px; border-bottom: 1px solid var(--line); background: #0f1a2d;
+      position: sticky; top: 0;
+    }
+    tbody td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 13px; }
+    tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+    .badge {
+      display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 8px; font-weight: 600; font-size: 11px;
+      border: 1px solid transparent;
+    }
+    .green { background: rgba(22,163,74,.17); color: #7ef0a5; border-color: rgba(22,163,74,.35); }
+    .red { background: rgba(220,38,38,.16); color: #ff9fa3; border-color: rgba(220,38,38,.35); }
+    .orange { background: rgba(234,88,12,.16); color: #ffbe91; border-color: rgba(234,88,12,.35); }
+    .amber { background: rgba(217,119,6,.16); color: #ffd48d; border-color: rgba(217,119,6,.35); }
+    .blue { background: rgba(37,99,235,.16); color: #b2c9ff; border-color: rgba(37,99,235,.35); }
+    .purple { background: rgba(124,58,237,.16); color: #cfb2ff; border-color: rgba(124,58,237,.35); }
+    .slate { background: rgba(100,116,139,.16); color: #b7c3d8; border-color: rgba(100,116,139,.35); }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 12px; }
+    .review {
+      display: flex; gap: 8px; align-items: center;
+    }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,.55);
+      display: none; align-items: center; justify-content: center; padding: 18px; z-index: 20;
+    }
+    .modal.open { display: flex; }
+    .modal-card {
+      width: min(980px, 96vw); max-height: 90vh; overflow: auto;
+      background: #0f1a2d; border: 1px solid var(--line); border-radius: 12px; padding: 14px;
+    }
+    .grid {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px;
+    }
+    .box {
+      border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: #0b1526;
+    }
+    .k { color: var(--muted); font-size: 12px; }
+    .v { font-size: 13px; word-break: break-word; }
+    .transcript {
+      border: 1px solid var(--line); border-radius: 10px; background: #0b1526; padding: 10px; max-height: 280px; overflow: auto;
+    }
+    .line { margin: 0 0 6px; font-size: 13px; }
+    .line b { color: #c7d9ff; }
+    input[type="text"] {
+      width: 180px; max-width: 100%;
+      border: 1px solid var(--line); background: #0b1526; color: var(--text);
+      border-radius: 8px; padding: 6px 8px; font-size: 12px;
+    }
+    button {
+      border: 1px solid #2d4771; background: #163055; color: #cdddf9;
+      border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+    }
+    button:hover { filter: brightness(1.1); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div>
+        <h1 class="title">Aegean Voice Call Monitor</h1>
+        <div class="meta">Live incoming call review with color-coded status</div>
+      </div>
+      <div class="controls">
+        <input id="dateFilter" type="date" />
+        <button id="clearDate">All Dates</button>
+        <div class="meta">Auto refresh: 5s | <span id="last">-</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Start Time</th>
+            <th>Status</th>
+            <th>Caller</th>
+            <th>Summary</th>
+            <th>Route</th>
+            <th>Result</th>
+            <th>Tokens / Cost</th>
+            <th>Details</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="modal" class="modal" onclick="closeModal(event)">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3 style="margin:0;">Call Details</h3>
+        <button onclick="hideModal()">Close</button>
+      </div>
+      <div id="modalContent"></div>
+    </div>
+  </div>
+
+  <script>
+    const callsById = new Map();
+    function fmtDate(iso) {
+      if (!iso) return "-";
+      const d = new Date(iso);
+      return d.toLocaleString();
+    }
+    function fmtDateShort(isoDate, hhmm) {
+      if (!isoDate) return "-";
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(isoDate));
+      if (!m) return isoDate;
+      return `${m[3]}/${m[2]} ${hhmm || ""}`.trim();
+    }
+    function fmtMin(ms) {
+      if (!ms) return "0s";
+      const s = Math.round(ms / 1000);
+      if (s < 60) return `${s}s`;
+      return `${Math.floor(s / 60)}m ${s % 60}s`;
+    }
+    function esc(v) {
+      return String(v ?? "").replace(/[&<>"]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[m]));
+    }
+    function summaryLine(c) {
+      const schedule = c.bookingFor === "later"
+        ? `Later: ${fmtDateShort(c.scheduledDate, c.scheduledTime)}`
+        : "Now";
+      return [
+        `From: ${c.pickup || "-"}`,
+        `To: ${c.dropoff || "-"}`,
+        schedule,
+        `Category: ${c.category || "-"}`,
+        `Passengers: ${c.passengers || "-"}`,
+        `Name: ${c.clientName || "-"}`
+      ].join(" | ");
+    }
+    async function setReview(uuid) {
+      const labelEl = document.getElementById(`label_${uuid}`);
+      const notesEl = document.getElementById(`notes_${uuid}`);
+      const body = {
+        reviewed: true,
+        reviewLabel: labelEl?.value || "",
+        reviewNotes: notesEl?.value || ""
+      };
+      await fetch(`/api/dashboard/calls/${encodeURIComponent(uuid)}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      await load();
+    }
+    function hideModal() {
+      document.getElementById("modal").classList.remove("open");
+    }
+    function closeModal(ev) {
+      if (ev.target.id === "modal") hideModal();
+    }
+    function openDetails(uuid) {
+      const c = callsById.get(uuid);
+      if (!c) return;
+      const transcripts = Array.isArray(c.transcripts) ? c.transcripts : [];
+      const parsed = c.parsedSummary || {};
+      const handover = c.handover || null;
+      const html = `
+        <div class="grid">
+          <div class="box"><div class="k">UUID</div><div class="v mono">${esc(c.uuid || "-")}</div></div>
+          <div class="box"><div class="k">Status</div><div class="v"><span class="badge ${esc(c.statusColor || "slate")}">${esc(c.statusCode || "UNKNOWN")}</span></div></div>
+          <div class="box"><div class="k">Caller</div><div class="v">${esc(c.from || "-")}</div></div>
+          <div class="box"><div class="k">Start / Duration</div><div class="v">${esc(fmtDate(c.startedAt))} / ${esc(fmtMin(c.durationMs))}</div></div>
+          <div class="box"><div class="k">System Understood (summary)</div><div class="v">${esc(summaryLine(c))}</div></div>
+          <div class="box"><div class="k">Parsed By Agent</div><div class="v mono">${esc(JSON.stringify(parsed || {}, null, 2))}</div></div>
+        </div>
+        <div class="box" style="margin-bottom:10px;">
+          <div class="k">Handover / Failure Context</div>
+          <div class="v">${handover ? esc(`${handover.reason || "-"} | ${handover.summary || ""}`) : esc(c.endCallReason || "none")}</div>
+        </div>
+        <div class="box" style="margin-bottom:10px;">
+          <div class="k">Review</div>
+          <div class="review" style="margin-top:6px;">
+            <input id="label_${esc(c.uuid)}" type="text" placeholder="label" value="${esc(c.reviewLabel || "")}" />
+            <input id="notes_${esc(c.uuid)}" type="text" placeholder="notes" value="${esc(c.reviewNotes || "")}" />
+            <button onclick="setReview('${esc(c.uuid)}')">${c.reviewed ? "Update" : "Review"}</button>
+          </div>
+        </div>
+        <div class="transcript">
+          <div class="k" style="margin-bottom:8px;">Caller Transcript</div>
+          ${
+            transcripts.length
+              ? transcripts.map(t => `<p class="line"><b>${esc(t.speaker || "caller")}:</b> ${esc(t.text || "")}</p>`).join("")
+              : '<p class="line muted">No transcript lines captured yet.</p>'
+          }
+        </div>
+      `;
+      document.getElementById("modalContent").innerHTML = html;
+      document.getElementById("modal").classList.add("open");
+    }
+    async function load() {
+      const selectedDate = document.getElementById("dateFilter").value;
+      const q = new URLSearchParams({ limit: "250" });
+      if (selectedDate) q.set("date", selectedDate);
+      const res = await fetch(`/api/dashboard/calls?${q.toString()}`);
+      const data = await res.json();
+      const rows = document.getElementById("rows");
+      rows.innerHTML = "";
+      callsById.clear();
+      for (const c of (data.calls || [])) {
+        callsById.set(c.uuid, c);
+        const tr = document.createElement("tr");
+        const cost = c.openaiEstimatedCostRange?.blend?.eur ?? 0;
+        const tok = c.openaiUsageTotals?.totalTokens ?? 0;
+        tr.innerHTML = `
+          <td>
+            <div>${fmtDate(c.startedAt)}</div>
+            <div class="tiny muted">${fmtMin(c.durationMs)}</div>
+          </td>
+          <td><span class="badge ${esc(c.statusColor || "slate")}">${esc(c.statusCode || "UNKNOWN")}</span></td>
+          <td>
+            <div>${esc(c.from || "-")}</div>
+            <div class="tiny muted">${esc(c.language || "en")}</div>
+          </td>
+          <td>
+            <div class="tiny">${esc(summaryLine(c))}</div>
+            <div class="tiny muted">intent: ${esc(c.intent || "unknown")} | turns: ${esc(c.turns || 0)}</div>
+          </td>
+          <td>
+            <div>${esc(c.island || "-")}</div>
+            <div class="tiny muted">${esc(c.pickup || "-")} → ${esc(c.dropoff || "-")}</div>
+          </td>
+          <td>
+            <div>booking: ${c.bookingCreated ? "yes" : "no"} ${c.orderId ? `(${esc(c.orderId)})` : ""}</div>
+            <div class="tiny muted">failures b/r/q: ${esc(c.bookingFailures || 0)}/${esc(c.resolveFailures || 0)}/${esc(c.quoteFailures || 0)}</div>
+          </td>
+          <td>
+            <div>${esc(tok)} tokens</div>
+            <div class="tiny muted">~€${Number(cost || 0).toFixed(3)} (blend)</div>
+          </td>
+          <td>
+            <button onclick="openDetails('${esc(c.uuid)}')">Open</button>
+          </td>
+        `;
+        rows.appendChild(tr);
+      }
+      document.getElementById("last").textContent = new Date().toLocaleTimeString();
+    }
+    document.getElementById("clearDate").addEventListener("click", () => {
+      document.getElementById("dateFilter").value = "";
+      load();
+    });
+    document.getElementById("dateFilter").addEventListener("change", load);
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>

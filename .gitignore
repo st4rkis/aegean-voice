@@ -1,0 +1,30 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+scripts/deploy.env
+*.pem
+*.key
+*.crt
+
+# Runtime artifacts
+logs/
+*.log
+.DS_Store
+
+# Build/output/temp
+dist/
+build/
+.cache/
+tmp/
+*.tmp
+
+# PM2 / local process files
+.pm2/

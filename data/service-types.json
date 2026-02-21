@@ -1,0 +1,46 @@
+{
+  "defaultCategory": "economy",
+  "areas": {
+    "mykonos": {
+      "economy": "Business",
+      "van": "Microbus",
+      "minibus": "Bus"
+    },
+    "santorini": {
+      "economy": "SUV",
+      "van": "Minivan",
+      "minibus": "Van"
+    },
+    "milos": {
+      "economy": "Economy",
+      "van": "Medium cargo van"
+    },
+    "rhodes": {
+      "economy": "Tesla Model 3",
+      "van": "Cargo minibus",
+      "minibus": "Mercedes V-Class"
+    },
+    "kos": {
+      "economy": "Exceptional",
+      "van": "Commercial minibus long"
+    },
+    "paros": {
+      "economy": "Tesla Model X",
+      "van": "Small cargo van"
+    },
+    "heraklion": {
+      "economy": "Luxury",
+      "van": "Commercial minibus long"
+    },
+    "naxos": {
+      "economy": "Tesla Model S"
+    },
+    "tinos": {
+      "economy": "Black car"
+    },
+    "bodrum": {
+      "economy": "Black car",
+      "van": "Commercial minibus long"
+    }
+  }
+}
