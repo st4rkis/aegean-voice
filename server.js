@@ -43,12 +43,23 @@ const USE_PREP_TALK = /^true$/i.test(process.env.USE_PREP_TALK || "false");
 const WS_SHARED_SECRET = process.env.WS_SHARED_SECRET || "";
 
 // ONDE Operator API
+const BACKEND_MODE = String(process.env.BACKEND_MODE || "onde").trim().toLowerCase();
+const ACTIVE_BACKEND_MODE = BACKEND_MODE === "nq" ? "nq" : "onde";
 const ONDE_BASE_URL = (process.env.ONDE_BASE_URL || process.env.ONDE_HOSTNAME || "https://api-sandbox.onde.app")
   .replace(/^api\./, "https://api.")
   .replace(/\/+$/, "");
 const ONDE_OPERATOR_TOKEN = process.env.ONDE_OPERATOR_TOKEN || process.env.ONDE_API_KEY || "";
 const ONDE_AUTH_SCHEME = process.env.ONDE_AUTH_SCHEME ?? "Bearer";
 const ONDE_TIMEOUT_MS = Number(process.env.ONDE_TIMEOUT_MS || 7000);
+const NQ_BASE_URL = String(process.env.NQ_BASE_URL || "").trim().replace(/\/+$/, "");
+const NQ_TIMEOUT_MS = Number(process.env.NQ_TIMEOUT_MS || 7000);
+const NQ_SERVICE_TOKEN = String(process.env.NQ_SERVICE_TOKEN || "").trim();
+const NQ_CALL_NUMBER_ID = String(process.env.NQ_CALL_NUMBER_ID || "").trim();
+const NQ_COMPANY_ID = String(process.env.NQ_COMPANY_ID || "").trim();
+const NQ_COMPANY_CODE = String(process.env.NQ_COMPANY_CODE || "").trim();
+const NQ_PUBLIC_CLIENT_ID = String(process.env.NQ_PUBLIC_CLIENT_ID || "").trim();
+const NQ_PUBLIC_CLIENT_SECRET = String(process.env.NQ_PUBLIC_CLIENT_SECRET || "").trim();
+const NQ_TRANSCRIPT_ENABLED = !/^false$/i.test(String(process.env.NQ_TRANSCRIPT_ENABLED || "true"));
 const ONDE_ALLOWED_VEHICLE_TYPES = new Set(
   String(process.env.ONDE_ALLOWED_VEHICLE_TYPES || "")
     .split(",")
@@ -86,6 +97,8 @@ const VONAGE_SAMPLE_RATE = 16000;
 const OPENAI_SAMPLE_RATE = 24000;
 let lastNominatimCallAt = 0;
 const placeCache = new Map();
+const nqCallContextCache = new Map();
+const nqPublicTokenCache = new Map();
 
 function normalizeText(value) {
   return String(value || "")
@@ -1038,6 +1051,221 @@ function ondeHeaders() {
   };
 }
 
+function makeIdempotencyKey(prefix, callState) {
+  const base = [prefix, callState?.uuid || crypto.randomUUID(), Date.now()].join("-");
+  return base.slice(0, 120);
+}
+
+function nqServiceHeaders(extra = {}, companyId = "") {
+  return {
+    "Content-Type": "application/json",
+    ...(NQ_SERVICE_TOKEN ? { Authorization: `Bearer ${NQ_SERVICE_TOKEN}` } : {}),
+    ...(companyId ? { "x-company-id": companyId } : {}),
+    ...extra,
+  };
+}
+
+async function nqResolveCompanyContextByNumber(numberId) {
+  const key = String(numberId || "").trim();
+  if (!NQ_BASE_URL || !NQ_SERVICE_TOKEN || !key) return null;
+  const cached = nqCallContextCache.get(key);
+  if (cached && Date.now() - cached.cachedAt < 10 * 60 * 1000) return cached.value;
+  try {
+    const data = await requestJson(
+      `${NQ_BASE_URL}/v1/private/channels/resolve/call/${encodeURIComponent(key)}`,
+      {
+        method: "GET",
+        headers: nqServiceHeaders(),
+      },
+      NQ_TIMEOUT_MS
+    );
+    const value = {
+      companyId: String(data?.company_id || "").trim(),
+      companyCode: String(data?.code || "").trim(),
+    };
+    if (value.companyId) nqCallContextCache.set(key, { cachedAt: Date.now(), value });
+    return value.companyId ? value : null;
+  } catch (err) {
+    console.log("nq_resolve_company_error", {
+      numberId: key,
+      message: err?.message || String(err),
+    });
+    return null;
+  }
+}
+
+async function ensureNqCallContext(callState) {
+  if (!callState) return { companyId: "", companyCode: "" };
+  if (callState.companyId || callState.companyCode) {
+    return { companyId: callState.companyId || "", companyCode: callState.companyCode || "" };
+  }
+  if (NQ_COMPANY_ID || NQ_COMPANY_CODE) {
+    callState.companyId = NQ_COMPANY_ID || callState.companyId || "";
+    callState.companyCode = NQ_COMPANY_CODE || callState.companyCode || "";
+    return { companyId: callState.companyId || "", companyCode: callState.companyCode || "" };
+  }
+  const numberId = callState.numberId || NQ_CALL_NUMBER_ID;
+  if (!numberId) return { companyId: "", companyCode: "" };
+  const resolved = await nqResolveCompanyContextByNumber(numberId);
+  if (resolved?.companyId) {
+    callState.companyId = resolved.companyId;
+    callState.companyCode = resolved.companyCode || callState.companyCode || "";
+  }
+  return { companyId: callState.companyId || "", companyCode: callState.companyCode || "" };
+}
+
+async function nqIssuePublicToken(companyId) {
+  if (!NQ_BASE_URL || !NQ_PUBLIC_CLIENT_ID || !NQ_PUBLIC_CLIENT_SECRET || !companyId) {
+    return "";
+  }
+  const cache = nqPublicTokenCache.get(companyId);
+  if (cache && cache.token && cache.expiresAt > Date.now() + 45_000) {
+    return cache.token;
+  }
+  try {
+    const data = await requestJson(
+      `${NQ_BASE_URL}/v1/public/auth/token`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: NQ_PUBLIC_CLIENT_ID,
+          client_secret: NQ_PUBLIC_CLIENT_SECRET,
+          tenant_id: companyId,
+        }),
+      },
+      NQ_TIMEOUT_MS
+    );
+    const token = String(data?.access_token || "").trim();
+    if (!token) return "";
+    const expiresIn = Number(data?.expires_in_sec || data?.expires_in || 900);
+    nqPublicTokenCache.set(companyId, {
+      token,
+      expiresAt: Date.now() + Math.max(60, expiresIn) * 1000,
+    });
+    return token;
+  } catch (err) {
+    console.log("nq_public_token_error", {
+      companyId,
+      message: err?.message || String(err),
+    });
+    return "";
+  }
+}
+
+async function nqCreateQuote(callState, input) {
+  if (!NQ_BASE_URL) return { error: "nq_not_configured" };
+  const ctx = await ensureNqCallContext(callState);
+  if (!ctx.companyId) return { error: "nq_company_not_resolved" };
+  const token = await nqIssuePublicToken(ctx.companyId);
+  if (!token) return { error: "nq_public_token_unavailable" };
+  try {
+    return await requestJson(
+      `${NQ_BASE_URL}/v1/public/dispatch/quotes`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "idempotency-key": makeIdempotencyKey("nq-quote", callState),
+        },
+        body: JSON.stringify(
+          clean({
+            tenant_id: ctx.companyId,
+            pickup: input?.pickup,
+            dropoff: input?.dropoff,
+            vehicle_category: input?.vehicle_category,
+          })
+        ),
+      },
+      NQ_TIMEOUT_MS
+    );
+  } catch (err) {
+    return {
+      error: "nq_quote_failed",
+      message: err?.message || String(err),
+    };
+  }
+}
+
+async function nqCreateOrder(callState, payload) {
+  if (!NQ_BASE_URL || !NQ_SERVICE_TOKEN) return { error: "nq_not_configured" };
+  const ctx = await ensureNqCallContext(callState);
+  const numberId = callState?.numberId || NQ_CALL_NUMBER_ID;
+  try {
+    if (numberId) {
+      return await requestJson(
+        `${NQ_BASE_URL}/v1/private/channels/call/orders`,
+        {
+          method: "POST",
+          headers: nqServiceHeaders(
+            { "idempotency-key": makeIdempotencyKey("nq-call-order", callState) },
+            ctx.companyId
+          ),
+          body: JSON.stringify(
+            clean({
+              number_id: numberId,
+              ...payload,
+            })
+          ),
+        },
+        NQ_TIMEOUT_MS
+      );
+    }
+    if (!ctx.companyId) {
+      return { error: "nq_company_not_resolved" };
+    }
+    return await requestJson(
+      `${NQ_BASE_URL}/v1/private/orders/orders`,
+      {
+        method: "POST",
+        headers: nqServiceHeaders(
+          { "idempotency-key": makeIdempotencyKey("nq-order", callState) },
+          ctx.companyId
+        ),
+        body: JSON.stringify(
+          clean({
+            source_channel: "call",
+            ...payload,
+          })
+        ),
+      },
+      NQ_TIMEOUT_MS
+    );
+  } catch (err) {
+    return {
+      error: "nq_create_order_failed",
+      message: err?.message || String(err),
+    };
+  }
+}
+
+async function nqCancelOrder(callState, orderId, reason = "client_request") {
+  if (!NQ_BASE_URL || !NQ_SERVICE_TOKEN) return { error: "nq_not_configured" };
+  if (!orderId) return { error: "missing_order_id" };
+  const ctx = await ensureNqCallContext(callState);
+  if (!ctx.companyId) return { error: "nq_company_not_resolved" };
+  try {
+    return await requestJson(
+      `${NQ_BASE_URL}/v1/private/orders/orders/${encodeURIComponent(orderId)}/cancel`,
+      {
+        method: "POST",
+        headers: nqServiceHeaders(
+          { "idempotency-key": makeIdempotencyKey("nq-cancel", callState) },
+          ctx.companyId
+        ),
+        body: JSON.stringify({ reason }),
+      },
+      NQ_TIMEOUT_MS
+    );
+  } catch (err) {
+    return {
+      error: "nq_cancel_order_failed",
+      message: err?.message || String(err),
+    };
+  }
+}
+
 async function ondeCreateOrder(orderRequest) {
   if (!ONDE_BASE_URL || !ONDE_OPERATOR_TOKEN) {
     return { error: "onde_not_configured" };
@@ -1304,6 +1532,97 @@ async function sendWhatsapp(payload) {
   );
 }
 
+function extractOrderId(result) {
+  return String(
+    result?.orderId ||
+      result?.order_id ||
+      result?.order?.orderId ||
+      result?.order?.order_id ||
+      ""
+  ).trim();
+}
+
+function normalizeConversationPhone(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeConversationName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function buildNqConversationId(callState) {
+  const companyId = String(callState?.companyId || NQ_COMPANY_ID || "").trim();
+  if (!companyId) return "";
+  const callId = String(callState?.uuid || "").trim().toLowerCase();
+  const phone = normalizeConversationPhone(callState?.phone || callState?.from || "");
+  const name = normalizeConversationName(callState?.name || "");
+  const payload = `${companyId}|${phone}|${name}|${callId}`;
+  const digest = crypto.createHash("sha1").update(payload).digest("hex").slice(0, 14);
+  return `conv_${companyId}_${digest}`;
+}
+
+function transcriptSenderFromSpeaker(speaker) {
+  const s = String(speaker || "").trim().toLowerCase();
+  if (s === "caller" || s === "client" || s === "user") return "caller";
+  if (s === "agent") return "agent";
+  return "system";
+}
+
+async function sinkTranscriptToNq(callState, speaker, text) {
+  if (ACTIVE_BACKEND_MODE !== "nq" || !NQ_TRANSCRIPT_ENABLED) return;
+  const cleanedText = String(text || "").trim();
+  if (!cleanedText || !NQ_BASE_URL || !NQ_SERVICE_TOKEN) return;
+
+  await ensureNqCallContext(callState);
+  if (!callState?.companyId) return;
+
+  if (!callState.nqConversationId) {
+    callState.nqConversationId = buildNqConversationId(callState);
+  }
+  if (!callState.nqConversationId) return;
+
+  try {
+    await requestJson(
+      `${NQ_BASE_URL}/v1/private/channels/call/transcripts`,
+      {
+        method: "POST",
+        headers: nqServiceHeaders({ "idempotency-key": makeIdempotencyKey("nq-transcript", callState) }, callState.companyId),
+        body: JSON.stringify(
+          clean({
+            number_id: callState.numberId || NQ_CALL_NUMBER_ID || undefined,
+            company_id: callState.companyId,
+            call_id: callState.uuid,
+            conversation_id: callState.nqConversationId,
+            customer_name: callState.name || undefined,
+            customer_phone: callState.phone || undefined,
+            sender: transcriptSenderFromSpeaker(speaker),
+            text: cleanedText,
+          })
+        ),
+      },
+      NQ_TIMEOUT_MS
+    );
+  } catch (err) {
+    console.log("nq_transcript_sink_error", {
+      uuid: callState?.uuid || "",
+      message: err?.message || String(err),
+    });
+  }
+}
+
+function extractAssistantTextFromOutputItem(item) {
+  if (!item || typeof item !== "object") return "";
+  const collected = [];
+  const content = Array.isArray(item.content) ? item.content : [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (typeof part.text === "string" && part.text.trim()) collected.push(part.text.trim());
+    if (typeof part.transcript === "string" && part.transcript.trim()) collected.push(part.transcript.trim());
+    if (typeof part.output_text === "string" && part.output_text.trim()) collected.push(part.output_text.trim());
+  }
+  return collected.join(" ").replace(/\s+/g, " ").trim();
+}
+
 function waypointFromParts(rawAddress, lat, lng) {
   if (Number.isFinite(lat) && Number.isFinite(lng)) {
     return {
@@ -1328,6 +1647,7 @@ function callStateToDashboardEntry(callState) {
   const durationMs = callState?.startedAt ? Date.now() - callState.startedAt : 0;
   const base = {
     uuid: callState?.uuid || "",
+    backendMode: ACTIVE_BACKEND_MODE,
     startedAt,
     endedAt: null,
     durationMs,
@@ -1451,7 +1771,13 @@ app.get("/health", (req, res) => {
     voice: OPENAI_VOICE,
     sttModel: OPENAI_STT_MODEL,
     integrations: {
+      backendMode: ACTIVE_BACKEND_MODE,
       ondeConfigured: Boolean(ONDE_BASE_URL && ONDE_OPERATOR_TOKEN),
+      nqConfigured: Boolean(NQ_BASE_URL && NQ_SERVICE_TOKEN),
+      nqCallNumberIdConfigured: Boolean(NQ_CALL_NUMBER_ID),
+      nqCompanyIdConfigured: Boolean(NQ_COMPANY_ID),
+      nqQuoteConfigured: Boolean(NQ_PUBLIC_CLIENT_ID && NQ_PUBLIC_CLIENT_SECRET),
+      nqTranscriptEnabled: Boolean(NQ_TRANSCRIPT_ENABLED),
       placeResolverConfigured: Boolean(PLACE_RESOLVER_URL || NOMINATIM_BASE_URL),
       placeResolverMode: PLACE_RESOLVER_URL ? "poi_db+remote+optional_nominatim" : "poi_db+internal_nominatim",
       poiDbLoaded: POI_DB.totalPois > 0,
@@ -1728,7 +2054,7 @@ function toolsDefinition() {
     {
       type: "function",
       name: "resolve_place",
-      description: "Resolve free-text place into ONDE-compatible waypoint. Requires external resolver endpoint.",
+      description: "Resolve free-text place into dispatch-compatible waypoint coordinates and label.",
       parameters: {
         type: "object",
         properties: {
@@ -1744,7 +2070,7 @@ function toolsDefinition() {
     {
       type: "function",
       name: "get_price_quote",
-      description: "Get tariff estimations from ONDE for price checks.",
+      description: "Get fare estimation for price checks.",
       parameters: {
         type: "object",
         properties: {
@@ -1764,7 +2090,7 @@ function toolsDefinition() {
     {
       type: "function",
       name: "create_booking",
-      description: "Create ONDE order after caller confirms.",
+      description: "Create order after caller confirms.",
       parameters: {
         type: "object",
         properties: {
@@ -1801,7 +2127,7 @@ function toolsDefinition() {
     {
       type: "function",
       name: "cancel_booking",
-      description: "Cancel an existing ONDE booking by order ID or latest booking from caller phone.",
+      description: "Cancel an existing booking by order ID or latest booking from caller phone.",
       parameters: {
         type: "object",
         properties: {
@@ -1919,6 +2245,10 @@ wss.on("connection", (vonageWs, req) => {
     pickupMode: "other",
     pickupType: "",
     pickupLabel: "",
+    numberId: NQ_CALL_NUMBER_ID || "",
+    companyId: NQ_COMPANY_ID || "",
+    companyCode: NQ_COMPANY_CODE || "",
+    nqConversationId: "",
     transportRef: "",
     transportOrigin: "",
     transportEta: "",
@@ -2275,25 +2605,52 @@ wss.on("connection", (vonageWs, req) => {
         return callState.lastQuoteResult;
       }
 
-      const tariffs = await ondeGetTariffs({
-        origin,
-        destination,
-        pickupTime: parsedPickupTime.mode === "later" ? parsedPickupTime.iso : undefined,
-        numberOfSeats: args?.number_of_seats || callState.passengers,
-        vehicleType: ondeServiceType || undefined,
-        tariffType: args?.tariff_type,
-        paymentMethods: args?.payment_method,
-      });
+      let quoteRaw = null;
+      let list = [];
+      let first = null;
 
-      callState.lastTariffs = tariffs;
-      if (tariffs?.error) {
-        callState.quoteFailures += 1;
+      if (ACTIVE_BACKEND_MODE === "nq") {
+        const nqQuote = await nqCreateQuote(callState, {
+          pickup: { lat: originLat, lng: originLng },
+          dropoff: { lat: destinationLat, lng: destinationLng },
+          vehicle_category: vehicleType || undefined,
+        });
+        quoteRaw = nqQuote;
+        if (nqQuote && !nqQuote.error && Number.isFinite(Number(nqQuote.quoted_price))) {
+          first = {
+            tariffId: nqQuote.quote_id || null,
+            name: "NQ Estimated Fare",
+            currency: nqQuote.currency || "EUR",
+            fixedCost: Number(nqQuote.quoted_price),
+            cost: Number(nqQuote.quoted_price),
+            minimumCharge: Number(nqQuote.quoted_price),
+            maximumCharge: Number(nqQuote.quoted_price),
+            etaMinutes: Number(nqQuote.eta_minutes || 0),
+            distanceKm: Number(nqQuote.distance_km || 0),
+          };
+          list = [first];
+        }
+      } else {
+        const tariffs = await ondeGetTariffs({
+          origin,
+          destination,
+          pickupTime: parsedPickupTime.mode === "later" ? parsedPickupTime.iso : undefined,
+          numberOfSeats: args?.number_of_seats || callState.passengers,
+          vehicleType: ondeServiceType || undefined,
+          tariffType: args?.tariff_type,
+          paymentMethods: args?.payment_method,
+        });
+        quoteRaw = tariffs;
+        list = tariffs?.tariffs || [];
+        first = list[0] || null;
       }
 
-      const list = tariffs?.tariffs || [];
-      const first = list[0] || null;
+      callState.lastTariffs = quoteRaw;
+      if (quoteRaw?.error) {
+        callState.quoteFailures += 1;
+      }
       let fallbackEstimate = null;
-      if (!first || tariffs?.error) {
+      if (!first || quoteRaw?.error) {
         const metrics = estimateTripMetrics(originLat, originLng, destinationLat, destinationLng);
         const fare = estimateFallbackFare({
           passengers: args?.number_of_seats || callState.passengers,
@@ -2323,8 +2680,8 @@ wss.on("connection", (vonageWs, req) => {
         fallbackFare: fallbackEstimate?.estimatedFareEur,
       });
       const quoteResult = {
-        error: tariffs?.error || null,
-        error_message: tariffs?.message || null,
+        error: quoteRaw?.error || null,
+        error_message: quoteRaw?.message || null,
         fallback_estimate: fallbackEstimate,
         tariffs_count: list.length,
         best: first
@@ -2338,7 +2695,7 @@ wss.on("connection", (vonageWs, req) => {
               maximumCharge: first.maximumCharge,
             }
           : null,
-        raw: tariffs,
+        raw: quoteRaw,
       };
       callState.lastQuoteSignature = quoteSignature;
       callState.lastQuoteResult = quoteResult;
@@ -2389,11 +2746,12 @@ wss.on("connection", (vonageWs, req) => {
       };
 
       const combinedNotes = [args?.notes, buildTransportNotes(callState)].filter(Boolean).join(" | ");
-      const orderPayload = clean({
+      const normalizedClientPhone = normalizePhoneE164(args?.phone || callState.phone) || undefined;
+      const orderPayloadOnde = clean({
         waypoints: [pickupWaypoint, dropoffWaypoint],
         client: {
           name: args?.name || callState.name || undefined,
-          phone: normalizePhoneE164(args?.phone || callState.phone) || undefined,
+          phone: normalizedClientPhone,
         },
         notes: combinedNotes || undefined,
         numberOfSeats: args?.passengers || callState.passengers,
@@ -2409,52 +2767,81 @@ wss.on("connection", (vonageWs, req) => {
         tariffId: args?.tariff_id,
         paymentMethods: args?.payment_methods?.length ? args.payment_methods : ["CASH"],
       });
+      const orderPayloadNq = clean({
+        customer_name: args?.name || callState.name || undefined,
+        customer_phone: normalizedClientPhone,
+        pickup: {
+          lat: pickupCoords.lat,
+          lng: pickupCoords.lng,
+          address: pickupWaypoint?.poiName || pickupWaypoint?.premise || callState.pickupRaw || undefined,
+        },
+        dropoff: {
+          lat: dropoffCoords.lat,
+          lng: dropoffCoords.lng,
+          address: dropoffWaypoint?.poiName || dropoffWaypoint?.premise || callState.dropoffRaw || undefined,
+        },
+        notes: combinedNotes || undefined,
+        passenger_count: args?.passengers || callState.passengers,
+        scheduled_at: parsedPickupTime.mode === "later" ? parsedPickupTime.iso : undefined,
+        vehicle_category_name: args?.vehicle_type || callState.vehicleTypePreference || undefined,
+      });
       console.log("create_booking_payload", {
         uuid,
+        backendMode: ACTIVE_BACKEND_MODE,
         pickupLabel: pickupWaypoint?.poiName || pickupWaypoint?.premise || null,
         pickupCoords,
         dropoffLabel: dropoffWaypoint?.poiName || dropoffWaypoint?.premise || null,
         dropoffCoords,
-        numberOfSeats: orderPayload?.numberOfSeats || null,
-        vehicleType: orderPayload?.vehicleType || null,
-        pickupTime: orderPayload?.pickupTime || "now",
+        numberOfSeats: orderPayloadOnde?.numberOfSeats || orderPayloadNq?.passenger_count || null,
+        vehicleType: orderPayloadOnde?.vehicleType || orderPayloadNq?.vehicle_category_name || null,
+        pickupTime: orderPayloadOnde?.pickupTime || orderPayloadNq?.scheduled_at || "now",
         pickupMode: callState.pickupMode,
         transportRef: callState.transportRef || null,
         transportOrigin: callState.transportOrigin || null,
         transportEta: callState.transportEta || null,
-        hasClientPhone: Boolean(orderPayload?.client?.phone),
+        hasClientPhone: Boolean(normalizedClientPhone),
       });
 
-      const result = await ondeCreateOrder(orderPayload);
-      if (result?.orderId) callState.orderId = result.orderId;
-      if (!result?.orderId) callState.bookingFailures += 1;
+      let result = null;
+      let offer = null;
+      if (ACTIVE_BACKEND_MODE === "nq") {
+        result = await nqCreateOrder(callState, orderPayloadNq);
+      } else {
+        result = await ondeCreateOrder(orderPayloadOnde);
+        const ondeOrderId = extractOrderId(result);
+        if (ondeOrderId) {
+          try {
+            offer = await ondeGetOrderOffer(ondeOrderId);
+            console.log("onde_offer", {
+              uuid,
+              orderId: ondeOrderId,
+              eta: offer?.eta || null,
+              driverId: offer?.driver?.driverId || null,
+              hasShareLocation: Boolean(findShareLocationUrl(offer)),
+            });
+          } catch {}
+        }
+      }
+
+      const createdOrderId = extractOrderId(result);
+      if (createdOrderId) callState.orderId = createdOrderId;
+      if (!createdOrderId) callState.bookingFailures += 1;
       console.log("tool_result", {
         uuid,
         name,
-        orderId: result?.orderId || null,
+        backendMode: ACTIVE_BACKEND_MODE,
+        orderId: createdOrderId || null,
         error: result?.error || null,
       });
 
       if (!callState.orderId) return result;
 
-      rememberOrderForPhone(orderPayload?.client?.phone || callState.phone, {
+      rememberOrderForPhone(normalizedClientPhone || callState.phone, {
         orderId: callState.orderId,
         island: callState.island,
         pickupLabel: pickupWaypoint?.poiName || pickupWaypoint?.premise || "",
         dropoffLabel: dropoffWaypoint?.poiName || dropoffWaypoint?.premise || "",
       });
-
-      let offer = null;
-      try {
-        offer = await ondeGetOrderOffer(callState.orderId);
-        console.log("onde_offer", {
-          uuid,
-          orderId: callState.orderId,
-          eta: offer?.eta || null,
-          driverId: offer?.driver?.driverId || null,
-          hasShareLocation: Boolean(findShareLocationUrl(offer)),
-        });
-      } catch {}
 
       const bookingResult = offer ? { ...result, offer } : result;
       const waPhone = normalizePhoneE164(args?.phone || callState.phone);
@@ -2529,11 +2916,14 @@ wss.on("connection", (vonageWs, req) => {
           message: "I could not find a recent booking to cancel. Please provide your booking ID.",
         };
       }
-      const result = await ondeCancelOrder(candidateOrderId, args?.reason || "client_request");
+      const result = ACTIVE_BACKEND_MODE === "nq"
+        ? await nqCancelOrder(callState, candidateOrderId, args?.reason || "client_request")
+        : await ondeCancelOrder(candidateOrderId, args?.reason || "client_request");
       if (result && !result.error) callState.cancelActionDone = true;
       console.log("tool_result", {
         uuid,
         name,
+        backendMode: ACTIVE_BACKEND_MODE,
         orderId: candidateOrderId,
         ok: Boolean(result && !result.error),
         error: result?.error || null,
@@ -2703,6 +3093,18 @@ wss.on("connection", (vonageWs, req) => {
   openaiWs.on("open", () => {
     console.log("openai_ws_open", { uuid });
     openaiReady = true;
+    if (ACTIVE_BACKEND_MODE === "nq") {
+      ensureNqCallContext(callState).then((ctx) => {
+        if (ctx.companyId || ctx.companyCode) {
+          console.log("nq_call_context_ready", {
+            uuid,
+            companyId: ctx.companyId || "",
+            companyCode: ctx.companyCode || "",
+            numberId: callState.numberId || "",
+          });
+        }
+      });
+    }
     initOpenAI();
     setTimeout(() => queueInitialGreetingOnce(), 1200);
   });
@@ -2719,6 +3121,7 @@ wss.on("connection", (vonageWs, req) => {
           text: String(evt.transcript),
         });
         if (callState.transcripts.length > 200) callState.transcripts = callState.transcripts.slice(-200);
+        void sinkTranscriptToNq(callState, "caller", evt.transcript);
       }
       console.log("stt_transcript", {
         uuid,
@@ -2823,8 +3226,21 @@ wss.on("connection", (vonageWs, req) => {
       return;
     }
 
-    if (evt.type === "response.output_item.done" && evt.item?.type === "function_call") {
-      await handleFunctionCallItem(evt.item);
+    if (evt.type === "response.output_item.done") {
+      if (evt.item?.type === "function_call") {
+        await handleFunctionCallItem(evt.item);
+        return;
+      }
+      const assistantText = extractAssistantTextFromOutputItem(evt.item);
+      if (assistantText) {
+        callState.transcripts.push({
+          at: nowIso(),
+          speaker: "assistant",
+          text: assistantText,
+        });
+        if (callState.transcripts.length > 200) callState.transcripts = callState.transcripts.slice(-200);
+        void sinkTranscriptToNq(callState, "assistant", assistantText);
+      }
       return;
     }
 
@@ -2889,12 +3305,19 @@ wss.on("connection", (vonageWs, req) => {
 
 server.listen(PORT, () => {
   console.log(`server_running port=${PORT}`);
+  console.log(`backend_mode=${ACTIVE_BACKEND_MODE}`);
   console.log(`public_base_url=${PUBLIC_BASE_URL}`);
   console.log(`openai_model=${OPENAI_REALTIME_MODEL}`);
   console.log(`openai_voice=${OPENAI_VOICE}`);
   console.log(`openai_stt_model=${OPENAI_STT_MODEL}`);
   console.log(`onde_base_url=${ONDE_BASE_URL}`);
   console.log(`onde_configured=${Boolean(ONDE_BASE_URL && ONDE_OPERATOR_TOKEN)}`);
+  console.log(`nq_base_url=${NQ_BASE_URL || "not_set"}`);
+  console.log(`nq_configured=${Boolean(NQ_BASE_URL && NQ_SERVICE_TOKEN)}`);
+  console.log(`nq_call_number_id=${NQ_CALL_NUMBER_ID || "not_set"}`);
+  console.log(`nq_company_id=${NQ_COMPANY_ID || "not_set"}`);
+  console.log(`nq_quote_configured=${Boolean(NQ_PUBLIC_CLIENT_ID && NQ_PUBLIC_CLIENT_SECRET)}`);
+  console.log(`nq_transcript_enabled=${Boolean(NQ_TRANSCRIPT_ENABLED)}`);
   console.log(`place_resolver_mode=${PLACE_RESOLVER_URL ? "remote" : "internal_nominatim"}`);
   console.log(`place_resolver_configured=${Boolean(PLACE_RESOLVER_URL || NOMINATIM_BASE_URL)}`);
   console.log(`poi_db_path=${POI_DB_PATH}`);
