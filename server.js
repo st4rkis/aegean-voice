@@ -544,9 +544,45 @@ function detectYesNo(text) {
 function detectNowLater(text) {
   const n = normalizeText(text);
   if (!n) return "unknown";
+  if (/^(no|no no|know|now now)$/.test(n)) return "now";
   if (/\b(now|immediately|right now|asap|τωρα|τώρα|αμεσα|άμεσα)\b/.test(n)) return "now";
   if (/\b(later|tomorrow|today at|prebook|schedule|scheduled|αυριο|αύριο|μετα|μετά|προκρατηση|προκράτηση)\b/.test(n)) return "later";
   return "unknown";
+}
+
+function detectNowLaterChoice(text) {
+  const n = normalizeText(text);
+  if (!n) return "unknown";
+  if (/\b(1|one|first|ένα|ενα)\b/.test(n)) return "now";
+  if (/\b(2|two|second|δυο|δύο)\b/.test(n)) return "later";
+  return "unknown";
+}
+
+function extractLikelyName(text) {
+  const cleaned = String(text || "")
+    .replace(/[^\p{L}\p{N}\s.'-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "";
+  const stop = new Set([
+    "my", "name", "is", "i", "am", "im", "its", "it", "this", "called", "call", "me",
+    "please", "book", "booking", "for", "at", "least", "yes", "no", "ok", "okay",
+  ]);
+  const pieces = cleaned
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const filtered = pieces.filter((part) => !stop.has(normalizeText(part)));
+  if (filtered.length === 0) return "";
+
+  const lettersOnly = filtered.every((part) => /^[\p{L}]$/u.test(part));
+  if (lettersOnly && filtered.length >= 2 && filtered.length <= 12) {
+    const joined = filtered.join("");
+    return looksLikeValidName(joined) ? joined : "";
+  }
+
+  const candidate = [filtered[0], filtered[1]].filter(Boolean).join(" ");
+  return looksLikeValidName(candidate) ? candidate : "";
 }
 
 function detectPriceIntent(text) {
@@ -748,6 +784,27 @@ function safeJsonParse(input) {
   } catch {
     return {};
   }
+}
+
+function extractDtmfDigitFromWsMessage(rawMessage) {
+  const evt = safeJsonParse(String(rawMessage || ""));
+  if (!evt || typeof evt !== "object") return "";
+  const candidates = [
+    evt?.digit,
+    evt?.dtmf,
+    evt?.dtmf?.digit,
+    evt?.payload?.digit,
+    evt?.payload?.dtmf,
+    evt?.payload?.dtmf?.digit,
+    evt?.event_data?.digit,
+    evt?.data?.digit,
+    evt?.key,
+  ];
+  for (const value of candidates) {
+    const digit = String(value || "").trim();
+    if (/^[0-9*#]$/.test(digit)) return digit;
+  }
+  return "";
 }
 
 function clean(obj) {
@@ -1978,26 +2035,35 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.post("/vonage/voice/event", (req, res) => {
-  const uuid = req.body?.uuid || req.query?.uuid || "unknown";
-  const status = req.body?.status || req.body?.type || "unknown";
-  const call = callRegistry.get(uuid);
-  console.log("vonage_event", {
-    uuid,
-    status,
-    timestamp: nowIso(),
-    durationMs: call ? Date.now() - call.startedAt : undefined,
-    body: req.body || {},
-    query: req.query || {},
-  });
-  res.status(204).send();
-});
+const VONAGE_ANSWER_PATHS = [
+  "/vonage/voice/answer",
+  "/vonage/answer",
+  "/voice/answer",
+  "/answer",
+  "/webhook/vonage/voice/answer",
+  "/webhooks/vonage/voice/answer",
+];
 
-app.post("/vonage/voice/answer", (req, res) => {
-  const uuid = req.body?.uuid || req.query?.uuid || crypto.randomUUID();
-  const from = req.body?.from || req.query?.from || "";
-  const to = req.body?.to || req.query?.to || "";
+const VONAGE_EVENT_PATHS = [
+  "/vonage/voice/event",
+  "/vonage/voice/eventWebhook",
+  "/vonage/event",
+  "/voice/event",
+  "/event",
+  "/webhook/vonage/voice/event",
+  "/webhooks/vonage/voice/event",
+];
 
+function vonageCallMeta(req) {
+  return {
+    uuid: req.body?.uuid || req.query?.uuid || crypto.randomUUID(),
+    from: req.body?.from || req.query?.from || "",
+    to: req.body?.to || req.query?.to || "",
+  };
+}
+
+function buildVonageAnswerNcco(meta) {
+  const { uuid, from, to } = meta;
   const wsBase = toWsBaseUrl(PUBLIC_BASE_URL);
   const ts = Date.now();
   const sig = WS_SHARED_SECRET ? signWsToken(uuid, ts) : "";
@@ -2021,17 +2087,43 @@ app.post("/vonage/voice/answer", (req, res) => {
     action: "connect",
     endpoint: [{ type: "websocket", uri: wsUrl, "content-type": "audio/l16;rate=16000" }],
   });
+  return ncco;
+}
 
-  console.log("answer_sent", {
+function handleVonageEvent(req, res) {
+  const uuid = req.body?.uuid || req.query?.uuid || "unknown";
+  const status = req.body?.status || req.body?.type || "unknown";
+  const call = callRegistry.get(uuid);
+  console.log("vonage_event", {
     uuid,
-    from: maskPhone(from),
-    to,
+    status,
+    method: req.method,
+    path: req.path,
+    timestamp: nowIso(),
+    durationMs: call ? Date.now() - call.startedAt : undefined,
+    body: req.body || {},
+    query: req.query || {},
+  });
+  res.status(204).send();
+}
+
+function handleVonageAnswer(req, res) {
+  const meta = vonageCallMeta(req);
+  const ncco = buildVonageAnswerNcco(meta);
+  console.log("answer_sent", {
+    uuid: meta.uuid,
+    from: maskPhone(meta.from),
+    to: meta.to,
+    method: req.method,
+    path: req.path,
     wsToken: WS_SHARED_SECRET ? "enabled" : "disabled",
     nccoActions: ncco.map((x) => x.action),
   });
-
   res.json(ncco);
-});
+}
+
+for (const path of VONAGE_EVENT_PATHS) app.all(path, handleVonageEvent);
+for (const path of VONAGE_ANSWER_PATHS) app.all(path, handleVonageAnswer);
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -2648,8 +2740,11 @@ wss.on("connection", (vonageWs, req) => {
     let awaitingUserReply = false;
     let activeStage = "ask_island";
     let pendingLaterText = "";
+    let retryNowLater = 0;
+    let retryNowLaterChoice = 0;
     let retryPickup = 0;
     let retryDropoff = 0;
+    let retryName = 0;
     let responseTimer = null;
     let deepgramReady = false;
     let deepgramFinalParts = [];
@@ -2843,9 +2938,46 @@ wss.on("connection", (vonageWs, req) => {
       if (activeStage === "ask_now_later") {
         const mode = detectNowLater(text);
         if (mode === "unknown") {
+          retryNowLater += 1;
+          if (retryNowLater >= 2) {
+            activeStage = "ask_now_later_choice";
+            retryNowLaterChoice = 0;
+            await scheduleSpeak("I am not catching that. Please say or press 1 for now, or 2 for later.", true);
+            return;
+          }
           await scheduleSpeak("Please say now or later.", true);
           return;
         }
+        retryNowLater = 0;
+        retryNowLaterChoice = 0;
+        callState.bookingFor = mode;
+        if (mode === "now") {
+          callState.pickupTime = "now";
+          activeStage = "ask_pickup";
+          await scheduleSpeak("What is your pickup location?", true);
+          return;
+        }
+        activeStage = "ask_later_time";
+        await scheduleSpeak("Please tell me date and time.", true);
+        return;
+      }
+
+      if (activeStage === "ask_now_later_choice") {
+        const mode = detectNowLaterChoice(text) !== "unknown" ? detectNowLaterChoice(text) : detectNowLater(text);
+        if (mode === "unknown") {
+          retryNowLaterChoice += 1;
+          if (retryNowLaterChoice >= 2) {
+            await askHumanOrEnd(
+              "time_mode_not_understood",
+              "I still could not understand whether this booking is for now or later."
+            );
+            return;
+          }
+          await scheduleSpeak("Please say or press 1 for now, or 2 for later.", true);
+          return;
+        }
+        retryNowLater = 0;
+        retryNowLaterChoice = 0;
         callState.bookingFor = mode;
         if (mode === "now") {
           callState.pickupTime = "now";
@@ -2992,13 +3124,24 @@ wss.on("connection", (vonageWs, req) => {
       }
 
       if (activeStage === "ask_name") {
-        const candidate = String(text || "").replace(/[^\p{L}\p{N}\s.'-]/gu, " ").trim();
-        if (!looksLikeValidName(candidate)) {
-          await scheduleSpeak("Please repeat the name for the booking.", true);
-          return;
+        const candidate = extractLikelyName(text);
+        if (!candidate) {
+          retryName += 1;
+          if (retryName === 1) {
+            await scheduleSpeak("Please say only the first name for the booking.", true);
+            return;
+          }
+          if (retryName === 2) {
+            await scheduleSpeak("Please spell your first name, letter by letter.", true);
+            return;
+          }
+          callState.name = "Guest";
+          callState.nameCaptured = true;
+        } else {
+          retryName = 0;
+          callState.name = candidate;
+          callState.nameCaptured = true;
         }
-        callState.name = candidate;
-        callState.nameCaptured = true;
         callState.intent = detectPriceIntent(text) ? "price_check" : "booking";
         const quote = await buildQuoteFromState(callState);
         if (quote?.error) {
@@ -3113,7 +3256,17 @@ wss.on("connection", (vonageWs, req) => {
 
     vonageWs.on("message", (msg) => {
       if (!deepgramReady || callClosed) return;
-      if (typeof msg === "string") return;
+      if (typeof msg === "string") {
+        const digit = extractDtmfDigitFromWsMessage(msg);
+        if (!digit) return;
+        utteranceChain = utteranceChain
+          .then(() => processCallerUtterance(digit))
+          .catch((err) => {
+            console.log("fsm_process_error", { uuid, message: err?.message || String(err) });
+            closeCall("fsm_process_error");
+          });
+        return;
+      }
       if (deepgramWs.readyState !== WebSocket.OPEN) return;
       try {
         deepgramWs.send(Buffer.from(msg));
