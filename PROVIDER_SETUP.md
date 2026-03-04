@@ -48,9 +48,7 @@ Store these in `.env`:
 
 ## 4) Runtime Mode
 
-- Keep current stable mode:
-  - `BACKEND_MODE=onde`
-- Switch to NQ:
+- Current runtime is NQ-only:
   - `BACKEND_MODE=nq`
 
 ## 5) Health Check

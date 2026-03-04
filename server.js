@@ -32,7 +32,9 @@ const USD_TO_EUR = Number(process.env.USD_TO_EUR || 0.8456);
 const OPENAI_BLEND_USD_PER_1M = Number(process.env.OPENAI_BLEND_USD_PER_1M || 45);
 const OPENAI_CALL_TOKEN_BUDGET = Math.max(1000, Number(process.env.OPENAI_CALL_TOKEN_BUDGET || 6000));
 
-const GREETING_TEXT = (process.env.GREETING_TEXT || "Hello, this is Alex Georgiadis from Meliton Transfers. We provide transfer services in Santorini. Would you like to book a ride now or for later?").trim();
+const GREETING_TEXT = (
+  process.env.GREETING_TEXT || "Welcome to Aegean Taxi! Can I have your pickup location please?"
+).trim();
 const PREP_TEXT = (
   process.env.PREP_TEXT ||
   "Aegean Taxi. To book fast, please say island, pickup, destination, passengers, and when. For price checks, say your pickup and destination."
@@ -43,8 +45,8 @@ const USE_PREP_TALK = /^true$/i.test(process.env.USE_PREP_TALK || "false");
 const WS_SHARED_SECRET = process.env.WS_SHARED_SECRET || "";
 
 // ONDE Operator API
-const BACKEND_MODE = String(process.env.BACKEND_MODE || "onde").trim().toLowerCase();
-const ACTIVE_BACKEND_MODE = BACKEND_MODE === "nq" ? "nq" : "onde";
+const BACKEND_MODE = String(process.env.BACKEND_MODE || "nq").trim().toLowerCase();
+const ACTIVE_BACKEND_MODE = "nq";
 const ONDE_BASE_URL = (process.env.ONDE_BASE_URL || process.env.ONDE_HOSTNAME || "https://api-sandbox.onde.app")
   .replace(/^api\./, "https://api.")
   .replace(/\/+$/, "");
@@ -1772,7 +1774,8 @@ app.get("/health", (req, res) => {
     sttModel: OPENAI_STT_MODEL,
     integrations: {
       backendMode: ACTIVE_BACKEND_MODE,
-      ondeConfigured: Boolean(ONDE_BASE_URL && ONDE_OPERATOR_TOKEN),
+      ondeConfigured: false,
+      ondeModeDisabled: true,
       nqConfigured: Boolean(NQ_BASE_URL && NQ_SERVICE_TOKEN),
       nqCallNumberIdConfigured: Boolean(NQ_CALL_NUMBER_ID),
       nqCompanyIdConfigured: Boolean(NQ_COMPANY_ID),
@@ -3306,12 +3309,14 @@ wss.on("connection", (vonageWs, req) => {
 server.listen(PORT, () => {
   console.log(`server_running port=${PORT}`);
   console.log(`backend_mode=${ACTIVE_BACKEND_MODE}`);
+  if (BACKEND_MODE && BACKEND_MODE !== "nq") {
+    console.log(`backend_mode_override_requested=${BACKEND_MODE}`);
+  }
   console.log(`public_base_url=${PUBLIC_BASE_URL}`);
   console.log(`openai_model=${OPENAI_REALTIME_MODEL}`);
   console.log(`openai_voice=${OPENAI_VOICE}`);
   console.log(`openai_stt_model=${OPENAI_STT_MODEL}`);
-  console.log(`onde_base_url=${ONDE_BASE_URL}`);
-  console.log(`onde_configured=${Boolean(ONDE_BASE_URL && ONDE_OPERATOR_TOKEN)}`);
+  console.log(`onde_mode_disabled=true`);
   console.log(`nq_base_url=${NQ_BASE_URL || "not_set"}`);
   console.log(`nq_configured=${Boolean(NQ_BASE_URL && NQ_SERVICE_TOKEN)}`);
   console.log(`nq_call_number_id=${NQ_CALL_NUMBER_ID || "not_set"}`);
