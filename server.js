@@ -101,6 +101,7 @@ let lastNominatimCallAt = 0;
 const placeCache = new Map();
 const nqCallContextCache = new Map();
 const nqPublicTokenCache = new Map();
+const nqVehicleCategoryCache = new Map();
 
 function normalizeText(value) {
   return String(value || "")
@@ -1114,6 +1115,80 @@ async function ensureNqCallContext(callState) {
     callState.companyCode = resolved.companyCode || callState.companyCode || "";
   }
   return { companyId: callState.companyId || "", companyCode: callState.companyCode || "" };
+}
+
+async function nqListVehicleCategories(companyId) {
+  const key = String(companyId || "").trim();
+  if (!NQ_BASE_URL || !NQ_SERVICE_TOKEN || !key) return [];
+  const cached = nqVehicleCategoryCache.get(key);
+  if (cached && Date.now() - cached.cachedAt < 10 * 60 * 1000) {
+    return cached.items;
+  }
+  try {
+    const data = await requestJson(
+      `${NQ_BASE_URL}/v1/private/companies/${encodeURIComponent(key)}/vehicle-categories?limit=100`,
+      {
+        method: "GET",
+        headers: nqServiceHeaders({}, key),
+      },
+      NQ_TIMEOUT_MS
+    );
+    const items = Array.isArray(data?.items)
+      ? data.items
+          .map((item) => ({
+            name: String(item?.name || "").trim(),
+            status: String(item?.status || "").trim().toLowerCase(),
+            capacity: Number(item?.passenger_capacity || 0),
+          }))
+          .filter((item) => item.name && item.status !== "disabled")
+      : [];
+    nqVehicleCategoryCache.set(key, { cachedAt: Date.now(), items });
+    return items;
+  } catch (err) {
+    console.log("nq_list_vehicle_categories_error", {
+      companyId: key,
+      message: err?.message || String(err),
+    });
+    return [];
+  }
+}
+
+function pickNqVehicleCategoryName(categories, requestedVehicleType, passengers) {
+  if (!Array.isArray(categories) || categories.length === 0) return undefined;
+  const requestedRaw = String(requestedVehicleType || "").trim();
+  const requestedNorm = normalizeText(requestedRaw);
+  const pax = Math.max(1, Number(passengers || 1) || 1);
+
+  if (requestedNorm) {
+    const exact = categories.find((c) => normalizeText(c.name) === requestedNorm);
+    if (exact?.name) return exact.name;
+  }
+
+  const pref = normalizeVehiclePreference(requestedVehicleType);
+  const withCapacity = categories
+    .filter((c) => Number.isFinite(c.capacity) && c.capacity > 0)
+    .sort((a, b) => a.capacity - b.capacity);
+
+  if (pref === "van") {
+    const byName = categories.find((c) => /van|minivan|mini bus|minibus|bus/i.test(c.name));
+    if (byName?.name) return byName.name;
+    const byCapacity = withCapacity.find((c) => c.capacity >= Math.max(5, pax));
+    if (byCapacity?.name) return byCapacity.name;
+    return withCapacity[withCapacity.length - 1]?.name || categories[0]?.name || undefined;
+  }
+
+  const standardLike = categories.find((c) => /economy|standard|sedan|car/i.test(c.name));
+  if (pref === "standard" && standardLike?.name) return standardLike.name;
+  const smallestThatFits = withCapacity.find((c) => c.capacity >= pax);
+  if (smallestThatFits?.name) return smallestThatFits.name;
+  return standardLike?.name || withCapacity[0]?.name || categories[0]?.name || undefined;
+}
+
+async function resolveNqVehicleCategoryName(callState, requestedVehicleType, passengers) {
+  const ctx = await ensureNqCallContext(callState);
+  if (!ctx.companyId) return undefined;
+  const categories = await nqListVehicleCategories(ctx.companyId);
+  return pickNqVehicleCategoryName(categories, requestedVehicleType, passengers);
 }
 
 async function nqIssuePublicToken(companyId) {
@@ -2750,6 +2825,13 @@ wss.on("connection", (vonageWs, req) => {
 
       const combinedNotes = [args?.notes, buildTransportNotes(callState)].filter(Boolean).join(" | ");
       const normalizedClientPhone = normalizePhoneE164(args?.phone || callState.phone) || undefined;
+      const requestedVehicleType = args?.vehicle_type || callState.vehicleTypePreference || "";
+      const requestedPassengers = args?.passengers || callState.passengers;
+      const nqVehicleCategoryName = await resolveNqVehicleCategoryName(
+        callState,
+        requestedVehicleType,
+        requestedPassengers
+      );
       const orderPayloadOnde = clean({
         waypoints: [pickupWaypoint, dropoffWaypoint],
         client: {
@@ -2762,9 +2844,9 @@ wss.on("connection", (vonageWs, req) => {
         vehicleType: sanitizeOndeVehicleType(
           resolveOndeServiceType({
             island: callState.island,
-            requestedVehicleType: args?.vehicle_type || callState.vehicleTypePreference,
+            requestedVehicleType,
             passengers: args?.passengers || callState.passengers,
-          }) || mapToOndeVehicleType(args?.vehicle_type || callState.vehicleTypePreference)
+          }) || mapToOndeVehicleType(requestedVehicleType)
         ),
         tariffType: args?.tariff_type,
         tariffId: args?.tariff_id,
@@ -2786,7 +2868,7 @@ wss.on("connection", (vonageWs, req) => {
         notes: combinedNotes || undefined,
         passenger_count: args?.passengers || callState.passengers,
         scheduled_at: parsedPickupTime.mode === "later" ? parsedPickupTime.iso : undefined,
-        vehicle_category_name: args?.vehicle_type || callState.vehicleTypePreference || undefined,
+        vehicle_category_name: nqVehicleCategoryName,
       });
       console.log("create_booking_payload", {
         uuid,
@@ -2797,6 +2879,8 @@ wss.on("connection", (vonageWs, req) => {
         dropoffCoords,
         numberOfSeats: orderPayloadOnde?.numberOfSeats || orderPayloadNq?.passenger_count || null,
         vehicleType: orderPayloadOnde?.vehicleType || orderPayloadNq?.vehicle_category_name || null,
+        requestedVehicleType: requestedVehicleType || null,
+        resolvedNqVehicleCategory: nqVehicleCategoryName || null,
         pickupTime: orderPayloadOnde?.pickupTime || orderPayloadNq?.scheduled_at || "now",
         pickupMode: callState.pickupMode,
         transportRef: callState.transportRef || null,
