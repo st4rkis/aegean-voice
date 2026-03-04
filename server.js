@@ -523,6 +523,16 @@ function parsePassengerCountFromText(text) {
   return 0;
 }
 
+function looksLikeValidName(text) {
+  const raw = String(text || "").trim();
+  if (raw.length < 2) return false;
+  const norm = normalizeText(raw);
+  if (!norm) return false;
+  if (/^\d+$/.test(norm)) return false;
+  if (/\b(yes|no|ok|okay|sure|correct|confirm|book|cancel|now|later|ναι|οχι|όχι)\b/.test(norm)) return false;
+  return /[a-zA-Z\u0370-\u03ff]/.test(raw);
+}
+
 function detectYesNo(text) {
   const n = normalizeText(text);
   if (!n) return "unknown";
@@ -2727,6 +2737,14 @@ wss.on("connection", (vonageWs, req) => {
 
     async function resolveAndValidate(kind, rawText) {
       const { result, waypoint } = await resolveWaypointForCall(callState, kind, rawText);
+      console.log("fsm_resolve", {
+        uuid,
+        kind,
+        query: rawText,
+        label: result?.best?.label || "",
+        confidence: result?.best?.confidence ?? null,
+        ok: Boolean(waypoint),
+      });
       if (waypoint) return { ok: true, result, waypoint };
       if (kind === "pickup") callState.resolveFailures += 1;
       if (kind === "dropoff") callState.resolveFailures += 1;
@@ -2879,8 +2897,37 @@ wss.on("connection", (vonageWs, req) => {
           return;
         }
         retryPickup = 0;
-        activeStage = "ask_dropoff";
-        await scheduleSpeak("What is your dropoff location?", true);
+        activeStage = "confirm_pickup";
+        await scheduleSpeak(`I understood pickup as ${callState.pickupLabel || callState.pickupRaw}. Is that correct?`, true);
+        return;
+      }
+
+      if (activeStage === "confirm_pickup") {
+        const yn = detectYesNo(text);
+        if (yn === "yes") {
+          activeStage = "ask_dropoff";
+          await scheduleSpeak("What is your dropoff location?", true);
+          return;
+        }
+        if (yn === "no") {
+          callState.pickupWaypoint = null;
+          callState.pickupRaw = "";
+          callState.pickupLabel = "";
+          callState.pickupType = "";
+          callState.pickupMode = "other";
+          retryPickup += 1;
+          if (retryPickup >= 2) {
+            await askHumanOrEnd(
+              "pickup_not_confirmed",
+              "I still could not confirm your pickup location."
+            );
+            return;
+          }
+          activeStage = "ask_pickup";
+          await scheduleSpeak("Please repeat your pickup location and spell it if needed.", true);
+          return;
+        }
+        await scheduleSpeak("Please answer yes or no.", true);
         return;
       }
 
@@ -2899,8 +2946,34 @@ wss.on("connection", (vonageWs, req) => {
           return;
         }
         retryDropoff = 0;
-        activeStage = "ask_passengers";
-        await scheduleSpeak("How many passengers?", true);
+        activeStage = "confirm_dropoff";
+        await scheduleSpeak(`I understood dropoff as ${callState.dropoffRaw}. Is that correct?`, true);
+        return;
+      }
+
+      if (activeStage === "confirm_dropoff") {
+        const yn = detectYesNo(text);
+        if (yn === "yes") {
+          activeStage = "ask_passengers";
+          await scheduleSpeak("How many passengers?", true);
+          return;
+        }
+        if (yn === "no") {
+          callState.dropoffWaypoint = null;
+          callState.dropoffRaw = "";
+          retryDropoff += 1;
+          if (retryDropoff >= 2) {
+            await askHumanOrEnd(
+              "dropoff_not_confirmed",
+              "I still could not confirm your dropoff location."
+            );
+            return;
+          }
+          activeStage = "ask_dropoff";
+          await scheduleSpeak("Please repeat your dropoff location and spell it if needed.", true);
+          return;
+        }
+        await scheduleSpeak("Please answer yes or no.", true);
         return;
       }
 
@@ -2920,7 +2993,7 @@ wss.on("connection", (vonageWs, req) => {
 
       if (activeStage === "ask_name") {
         const candidate = String(text || "").replace(/[^\p{L}\p{N}\s.'-]/gu, " ").trim();
-        if (candidate.length < 2) {
+        if (!looksLikeValidName(candidate)) {
           await scheduleSpeak("Please repeat the name for the booking.", true);
           return;
         }
@@ -2975,12 +3048,23 @@ wss.on("connection", (vonageWs, req) => {
         });
         const waPhone = normalizePhoneE164(callState.phone);
         if (waPhone) {
-          const waText = `Aegean Taxi booking confirmed. Order ID ${orderId}.`;
-          const waRes = await sendWhatsapp({ phone: waPhone, message: waText, booking_id: orderId, channel: "voice_ai_v1" });
-          callState.whatsappStatus = {
-            sent: Boolean(waRes && !waRes.error && !waRes.skipped),
-            reason: waRes?.reason || "",
-          };
+          try {
+            const waText = `Aegean Taxi booking confirmed. Order ID ${orderId}.`;
+            const waRes = await sendWhatsapp({ phone: waPhone, message: waText, booking_id: orderId, channel: "voice_ai_v1" });
+            callState.whatsappStatus = {
+              sent: Boolean(waRes && !waRes.error && !waRes.skipped),
+              reason: waRes?.reason || "",
+            };
+          } catch (waErr) {
+            callState.whatsappStatus = {
+              sent: false,
+              reason: "whatsapp_send_failed",
+            };
+            console.log("whatsapp_send_error", {
+              uuid,
+              message: waErr?.message || String(waErr),
+            });
+          }
         }
         await scheduleSpeak(`Booking confirmed. Your order id is ${orderId}. Thank you for calling Aegean Taxi. Goodbye.`, false);
         closeCall("booking_completed");
@@ -2990,7 +3074,13 @@ wss.on("connection", (vonageWs, req) => {
     deepgramWs.on("open", () => {
       deepgramReady = true;
       console.log("deepgram_ws_open", { uuid, model: DEEPGRAM_MODEL, language: DEEPGRAM_LANGUAGE });
-      void scheduleSpeak(`${GREETING_TEXT} Which island is the booking for?`, true);
+      const greetingOnly = String(GREETING_TEXT || "Welcome to Aegean Taxi.")
+        .replace(/\?.*$/s, "")
+        .trim() || "Welcome to Aegean Taxi.";
+      void (async () => {
+        await scheduleSpeak(greetingOnly, false);
+        await scheduleSpeak("Which island is the booking for?", true);
+      })();
     });
 
     deepgramWs.on("message", (raw) => {
