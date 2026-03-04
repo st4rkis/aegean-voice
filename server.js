@@ -2380,7 +2380,8 @@ wss.on("connection", (vonageWs, req) => {
   let initialGreetingAttempts = 0;
   let initialIslandQuestionQueued = false;
   let inSpeech = false;
-  let pendingResponseInstructions = null;
+  let pendingResponse = null;
+  let waitForCallerReply = false;
   let rateLimitBackoffUntilMs = 0;
   let lastResponseCreateAt = 0;
 
@@ -2395,22 +2396,26 @@ wss.on("connection", (vonageWs, req) => {
   }
 
   function requestModelResponse(extraInstructions = "", options = {}) {
-    const maxOutputTokens = Number(options?.maxOutputTokens || 60);
+    const normalizedOptions = {
+      maxOutputTokens: Number(options?.maxOutputTokens || 96),
+      waitForCaller: Boolean(options?.waitForCaller),
+    };
+    const maxOutputTokens = normalizedOptions.maxOutputTokens;
     if (!openaiReady) return false;
     if (Date.now() - lastResponseCreateAt < 650) {
-      pendingResponseInstructions = extraInstructions || "";
+      pendingResponse = { instructions: extraInstructions || "", options: normalizedOptions };
       return true;
     }
     if (Date.now() < rateLimitBackoffUntilMs) {
-      pendingResponseInstructions = extraInstructions || "";
+      pendingResponse = { instructions: extraInstructions || "", options: normalizedOptions };
       return true;
     }
     if (inSpeech) {
-      pendingResponseInstructions = extraInstructions || "";
+      pendingResponse = { instructions: extraInstructions || "", options: normalizedOptions };
       return true;
     }
     if (responseActive) {
-      pendingResponseInstructions = extraInstructions || "";
+      pendingResponse = { instructions: extraInstructions || "", options: normalizedOptions };
       return true;
     }
     responseActive = true;
@@ -2427,9 +2432,12 @@ wss.on("connection", (vonageWs, req) => {
     lastResponseCreateAt = Date.now();
     if (!sent) {
       responseActive = false;
-      pendingResponseInstructions = extraInstructions || "";
+      pendingResponse = { instructions: extraInstructions || "", options: normalizedOptions };
       console.log("openai_send_failed", { uuid, type: "response.create" });
       return false;
+    }
+    if (normalizedOptions.waitForCaller) {
+      waitForCallerReply = true;
     }
     return true;
   }
@@ -3081,7 +3089,7 @@ wss.on("connection", (vonageWs, req) => {
     if (toolName === "capture_call_details") {
       const nextQ = nextRequiredQuestionInstruction();
       if (nextQ) {
-        requestModelResponse(`${nextQ}\nAsk one question only.`);
+        requestModelResponse(`${nextQ}\nAsk one question only.`, { waitForCaller: true, maxOutputTokens: 80 });
         return;
       }
       requestModelResponse(
@@ -3092,7 +3100,8 @@ wss.on("connection", (vonageWs, req) => {
 
     if (toolName === "get_price_quote") {
       requestModelResponse(
-        "Say the price in one short sentence and ask only: Do you want me to book it now?"
+        "Say the price in one short sentence and ask only: Do you want me to book it now?",
+        { waitForCaller: true, maxOutputTokens: 90 }
       );
       return;
     }
@@ -3125,9 +3134,9 @@ wss.on("connection", (vonageWs, req) => {
         input_audio_transcription: { model: OPENAI_STT_MODEL },
         turn_detection: {
           type: "server_vad",
-          threshold: 0.76,
-          prefix_padding_ms: 220,
-          silence_duration_ms: 460,
+          threshold: 0.88,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 700,
         },
         temperature: OPENAI_TEMPERATURE,
         instructions: orchestrationPrompt(callState),
@@ -3167,7 +3176,7 @@ wss.on("connection", (vonageWs, req) => {
     }
     const ok = requestModelResponse(
       `Say this greeting once: "${GREETING_TEXT}"`,
-      { maxOutputTokens: 140 }
+      { maxOutputTokens: 220 }
     );
     if (!ok) {
       setTimeout(() => queueInitialGreetingOnce(), 700);
@@ -3202,6 +3211,7 @@ wss.on("connection", (vonageWs, req) => {
 
     if (evt.type === "conversation.item.input_audio_transcription.completed") {
       if (evt?.transcript) {
+        waitForCallerReply = false;
         callState.transcripts.push({
           at: nowIso(),
           speaker: "caller",
@@ -3232,8 +3242,7 @@ wss.on("connection", (vonageWs, req) => {
       const statusDetails = evt?.response?.status_details || evt?.response?.error || null;
       const incompleteReason = statusDetails?.reason || statusDetails?.error?.code || "";
       const errorCode = statusDetails?.error?.code || "";
-      const greetingConsideredDelivered =
-        status === "completed" || (status === "incomplete" && incompleteReason === "max_output_tokens");
+      const greetingConsideredDelivered = status === "completed";
       console.log("openai_response_done", { uuid, status, statusDetails });
       if (status === "failed" && errorCode === "rate_limit_exceeded") {
         rateLimitBackoffUntilMs = Date.now() + 1500;
@@ -3273,18 +3282,21 @@ wss.on("connection", (vonageWs, req) => {
           setTimeout(() => {
             requestModelResponse(`Ask exactly this question now: "Which island are you currently in?"`, {
               maxOutputTokens: 24,
+              waitForCaller: true,
             });
           }, 120);
         }
       }
       if (!greetingDone && status === "incomplete" && incompleteReason === "max_output_tokens") {
-        greetingDone = true;
-        allowUserSpeechAtMs = Date.now() + 500;
+        if (initialGreetingAttempts < 3) {
+          initialGreetingQueued = false;
+          setTimeout(() => queueInitialGreetingOnce(), 450);
+        }
       }
-      if (!inSpeech && pendingResponseInstructions !== null) {
-        const queued = pendingResponseInstructions;
-        pendingResponseInstructions = null;
-        requestModelResponse(queued);
+      if (!inSpeech && pendingResponse !== null && !waitForCallerReply) {
+        const queued = pendingResponse;
+        pendingResponse = null;
+        requestModelResponse(queued.instructions, queued.options);
       }
       return;
     }
@@ -3302,13 +3314,14 @@ wss.on("connection", (vonageWs, req) => {
       if (!greetingDone && !responseActive) {
         greetingDone = true;
         requestModelResponse(
-          "You are already in-progress with caller speech. Continue directly with this question: Which island are you currently in?"
+          "You are already in-progress with caller speech. Continue directly with this question: Which island are you currently in?",
+          { waitForCaller: true, maxOutputTokens: 40 }
         );
       }
-      if (pendingResponseInstructions !== null) {
-        const queued = pendingResponseInstructions;
-        pendingResponseInstructions = null;
-        requestModelResponse(queued);
+      if (pendingResponse !== null && !waitForCallerReply) {
+        const queued = pendingResponse;
+        pendingResponse = null;
+        requestModelResponse(queued.instructions, queued.options);
       }
       return;
     }
