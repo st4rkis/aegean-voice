@@ -2045,6 +2045,7 @@ server.on("upgrade", (req, socket, head) => {
 function shutdown(label, vonageWs, openaiWs, callState) {
   if (callState && !callState.endedAt) {
     callState.endedAt = Date.now();
+    void sinkTranscriptToNq(callState, "system", `Call ended (${label})`);
     const cost = estimateOpenAiCost(callState.openaiUsageTotals);
     const costRange = estimateOpenAiCostRangeFromTotal(callState.openaiUsageTotals.totalTokens);
     const startedAt = new Date(callState.startedAt).toISOString();
@@ -2623,6 +2624,7 @@ wss.on("connection", (vonageWs, req) => {
     },
   };
   callRegistry.set(uuid, callState);
+  void sinkTranscriptToNq(callState, "system", `Call started (${uuid})`);
 
   if (VOICE_STACK_MODE === "deepgram_elevenlabs_fsm") {
     console.log("voice_stack_call_start", {
