@@ -24,6 +24,7 @@ const OPENAI_VOICE = (process.env.OPENAI_VOICE || "coral").trim();
 const OPENAI_TEMPERATURE = Math.max(0.6, Number(process.env.OPENAI_TEMPERATURE || 0.7));
 const OPENAI_STT_MODEL = (process.env.OPENAI_STT_MODEL || "gpt-4o-transcribe").trim();
 const ASSISTANT_LANGUAGE_MODE = (process.env.ASSISTANT_LANGUAGE_MODE || "en").trim().toLowerCase(); // en|auto
+const VOICE_STACK_MODE = (process.env.VOICE_STACK_MODE || "deepgram_elevenlabs_fsm").trim().toLowerCase();
 const OPENAI_RATE_TEXT_INPUT_USD_PER_1M = Number(process.env.OPENAI_RATE_TEXT_INPUT_USD_PER_1M || 5);
 const OPENAI_RATE_TEXT_OUTPUT_USD_PER_1M = Number(process.env.OPENAI_RATE_TEXT_OUTPUT_USD_PER_1M || 20);
 const OPENAI_RATE_AUDIO_INPUT_USD_PER_1M = Number(process.env.OPENAI_RATE_AUDIO_INPUT_USD_PER_1M || 40);
@@ -94,6 +95,17 @@ const WHATSAPP_META_API_VERSION = (process.env.WHATSAPP_META_API_VERSION || "v22
 const WHATSAPP_META_PHONE_NUMBER_ID = (process.env.WHATSAPP_META_PHONE_NUMBER_ID || "").trim();
 const WHATSAPP_META_TOKEN = (process.env.WHATSAPP_META_TOKEN || "").trim();
 const ATHENS_TIMEZONE = process.env.OPS_TIMEZONE || "Europe/Athens";
+const DEEPGRAM_API_KEY = String(process.env.DEEPGRAM_API_KEY || "").trim();
+const DEEPGRAM_MODEL = String(process.env.DEEPGRAM_MODEL || "nova-2").trim();
+const DEEPGRAM_LANGUAGE = String(process.env.DEEPGRAM_LANGUAGE || "en").trim();
+const DEEPGRAM_ENDPOINTING_MS = Math.max(100, Number(process.env.DEEPGRAM_ENDPOINTING_MS || 500));
+const ELEVENLABS_API_KEY = String(process.env.ELEVENLABS_API_KEY || "").trim();
+const ELEVENLABS_VOICE_ID = String(process.env.ELEVENLABS_VOICE_ID || "").trim();
+const ELEVENLABS_MODEL_ID = String(process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2_5").trim();
+const ELEVENLABS_BASE_URL = (String(process.env.ELEVENLABS_BASE_URL || "https://api.elevenlabs.io") || "").replace(/\/+$/, "");
+const ELEVENLABS_OUTPUT_FORMAT = String(process.env.ELEVENLABS_OUTPUT_FORMAT || "pcm_16000").trim();
+const ELEVENLABS_TTS_TIMEOUT_MS = Math.max(1500, Number(process.env.ELEVENLABS_TTS_TIMEOUT_MS || 9000));
+const CALL_RESPONSE_TIMEOUT_MS = Math.max(20000, Number(process.env.CALL_RESPONSE_TIMEOUT_MS || 45000));
 
 const VONAGE_SAMPLE_RATE = 16000;
 const OPENAI_SAMPLE_RATE = 24000;
@@ -488,6 +500,87 @@ function normalizeScheduledPickup(args, referenceMs) {
 
   const iso = `${ymd}T${tm.hhmm}:00${athensOffsetForDate(ymd)}`;
   return { mode: "later", ok: true, iso, needsClarification: false, reason: "", localDate: ymd, localTime: tm.hhmm };
+}
+
+const PASSENGER_WORDS = new Map([
+  ["one", 1], ["two", 2], ["three", 3], ["four", 4], ["five", 5],
+  ["six", 6], ["seven", 7], ["eight", 8], ["nine", 9], ["ten", 10],
+  ["ένα", 1], ["δυο", 2], ["δύο", 2], ["τρεις", 3], ["τρια", 3], ["τρία", 3],
+  ["τέσσερα", 4], ["τεσσερα", 4], ["πέντε", 5], ["πεντε", 5], ["έξι", 6], ["εξι", 6],
+  ["επτά", 7], ["επτα", 7], ["οκτώ", 8], ["οκτω", 8],
+]);
+
+function parsePassengerCountFromText(text) {
+  const norm = normalizeText(text);
+  const direct = /\b(\d{1,2})\b/.exec(norm);
+  if (direct) {
+    const n = Number(direct[1]);
+    if (Number.isFinite(n) && n >= 1 && n <= 24) return n;
+  }
+  for (const [word, value] of PASSENGER_WORDS.entries()) {
+    if (norm.includes(word)) return value;
+  }
+  return 0;
+}
+
+function detectYesNo(text) {
+  const n = normalizeText(text);
+  if (!n) return "unknown";
+  if (/\b(yes|yeah|yep|correct|ok|okay|sure|book|go ahead|proceed|confirm|ναι|σωστα|σωστό|ok)\b/.test(n)) return "yes";
+  if (/\b(no|nope|cancel|stop|negative|not now|οχι|όχι|άκυρο|ακυρο)\b/.test(n)) return "no";
+  return "unknown";
+}
+
+function detectNowLater(text) {
+  const n = normalizeText(text);
+  if (!n) return "unknown";
+  if (/\b(now|immediately|right now|asap|τωρα|τώρα|αμεσα|άμεσα)\b/.test(n)) return "now";
+  if (/\b(later|tomorrow|today at|prebook|schedule|scheduled|αυριο|αύριο|μετα|μετά|προκρατηση|προκράτηση)\b/.test(n)) return "later";
+  return "unknown";
+}
+
+function detectPriceIntent(text) {
+  const n = normalizeText(text);
+  return /\b(price|cost|fare|how much|estimate|τιμη|τιμή|κοστος|κόστος)\b/.test(n);
+}
+
+function detectHumanEscalationIntent(text) {
+  const n = normalizeText(text);
+  return /\b(human|agent|operator|representative|person|ανθρωπο|άνθρωπο|εκπροσωπο|εκπρόσωπο|operator)\b/.test(n);
+}
+
+function detectExplicitNoAgent(text) {
+  const n = normalizeText(text);
+  return /\b(no agent|dont transfer|do not transfer|no human|χωρις ανθρωπο|χωρίς άνθρωπο|οχι ανθρωπο)\b/.test(n);
+}
+
+function areaAliasIndex() {
+  const rows = [];
+  for (const area of POI_DB.areas) {
+    const areaId = String(area?.id || "").trim();
+    if (!areaId) continue;
+    const names = [areaId, area?.name, ...(Array.isArray(area?.aliases) ? area.aliases : [])]
+      .map((x) => normalizeText(x))
+      .filter(Boolean);
+    for (const alias of names) {
+      rows.push({ alias, areaId });
+    }
+  }
+  rows.sort((a, b) => b.alias.length - a.alias.length);
+  return rows;
+}
+
+const AREA_ALIASES = areaAliasIndex();
+
+function detectAreaIdInText(text) {
+  const norm = normalizeText(text);
+  if (!norm) return "";
+  const direct = canonicalAreaId(norm);
+  if (direct) return direct;
+  for (const row of AREA_ALIASES) {
+    if (norm.includes(row.alias)) return row.areaId;
+  }
+  return "";
 }
 
 function pickupModeFromType(type, label) {
@@ -1847,6 +1940,9 @@ app.get("/health", (req, res) => {
     model: OPENAI_REALTIME_MODEL,
     voice: OPENAI_VOICE,
     sttModel: OPENAI_STT_MODEL,
+    voiceStackMode: VOICE_STACK_MODE,
+    deepgramModel: DEEPGRAM_MODEL,
+    elevenLabsVoiceId: ELEVENLABS_VOICE_ID || "",
     integrations: {
       backendMode: ACTIVE_BACKEND_MODE,
       ondeConfigured: false,
@@ -1866,6 +1962,8 @@ app.get("/health", (req, res) => {
         : Boolean(WHATSAPP_BASE_URL),
       whatsappProvider: WHATSAPP_PROVIDER,
       wsTokenEnabled: Boolean(WS_SHARED_SECRET),
+      deepgramConfigured: Boolean(DEEPGRAM_API_KEY),
+      elevenlabsConfigured: Boolean(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID),
     },
   });
 });
@@ -2285,14 +2383,178 @@ function responseGuardPrompt(state) {
   return `${languageGuard}\n${phoneGuard}\n${nameGuard}`;
 }
 
+function deepgramListenUrl() {
+  const params = new URLSearchParams({
+    model: DEEPGRAM_MODEL || "nova-2",
+    language: DEEPGRAM_LANGUAGE || "en",
+    smart_format: "true",
+    interim_results: "true",
+    encoding: "linear16",
+    sample_rate: String(VONAGE_SAMPLE_RATE),
+    channels: "1",
+    endpointing: String(DEEPGRAM_ENDPOINTING_MS),
+    punctuate: "true",
+    numerals: "true",
+  });
+  return `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+}
+
+async function elevenLabsSynthesizePcm(text) {
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID || !ELEVENLABS_BASE_URL) {
+    return { error: "elevenlabs_not_configured" };
+  }
+  const payload = {
+    text: String(text || "").trim(),
+    model_id: ELEVENLABS_MODEL_ID,
+    voice_settings: {
+      stability: 0.45,
+      similarity_boost: 0.75,
+      speed: 1.0,
+      use_speaker_boost: true,
+    },
+  };
+  if (!payload.text) return { error: "missing_tts_text" };
+  const url =
+    `${ELEVENLABS_BASE_URL}/v1/text-to-speech/${encodeURIComponent(ELEVENLABS_VOICE_ID)}` +
+    `?output_format=${encodeURIComponent(ELEVENLABS_OUTPUT_FORMAT)}`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ELEVENLABS_TTS_TIMEOUT_MS);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "application/octet-stream",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return {
+        error: "elevenlabs_tts_failed",
+        status: resp.status,
+        message: errText.slice(0, 220),
+      };
+    }
+    const ab = await resp.arrayBuffer();
+    const pcm = Buffer.from(ab);
+    if (!pcm.length) return { error: "elevenlabs_empty_audio" };
+    return { pcm };
+  } catch (err) {
+    return { error: "elevenlabs_tts_failed", message: err?.message || String(err) };
+  }
+}
+
+async function streamPcm16ToVonage(vonageWs, pcm) {
+  if (!pcm || !pcm.length) return;
+  const chunkBytes = 640; // 20ms @ 16kHz mono PCM16
+  for (let off = 0; off < pcm.length; off += chunkBytes) {
+    if (!vonageWs || vonageWs.readyState !== WebSocket.OPEN) break;
+    const chunk = pcm.subarray(off, Math.min(off + chunkBytes, pcm.length));
+    vonageWs.send(chunk);
+    await sleep(20);
+  }
+}
+
+function waypointCoords(waypoint) {
+  return {
+    lat: waypoint?.placeLatLng?.lat ?? waypoint?.exactLatLng?.lat ?? null,
+    lng: waypoint?.placeLatLng?.lng ?? waypoint?.exactLatLng?.lng ?? null,
+  };
+}
+
+async function resolveWaypointForCall(callState, kind, query) {
+  const result = await resolvePlace({
+    island: callState.island,
+    query,
+    kind,
+    language: callState.language || "en",
+  });
+  const wp = result?.best?.waypoint || result?.waypoint || null;
+  if (!wp) return { result, waypoint: null };
+  if (kind === "pickup") {
+    callState.pickupWaypoint = wp;
+    callState.pickupRaw = query;
+    callState.pickupLabel = result?.best?.label || wp?.poiName || wp?.premise || query;
+    callState.pickupType = result?.best?.type || "";
+    callState.pickupMode = pickupModeFromType(callState.pickupType, callState.pickupLabel);
+  } else {
+    callState.dropoffWaypoint = wp;
+    callState.dropoffRaw = query;
+  }
+  return { result, waypoint: wp };
+}
+
+async function buildQuoteFromState(callState) {
+  const pickup = waypointCoords(callState.pickupWaypoint);
+  const dropoff = waypointCoords(callState.dropoffWaypoint);
+  if (!Number.isFinite(Number(pickup.lat)) || !Number.isFinite(Number(pickup.lng)) ||
+      !Number.isFinite(Number(dropoff.lat)) || !Number.isFinite(Number(dropoff.lng))) {
+    return { error: "missing_waypoint_coordinates" };
+  }
+  const vehicleType = normalizeVehiclePreference(callState.vehicleTypePreference);
+
+  if (ACTIVE_BACKEND_MODE === "nq") {
+    const nqQuote = await nqCreateQuote(callState, {
+      pickup: { lat: Number(pickup.lat), lng: Number(pickup.lng) },
+      dropoff: { lat: Number(dropoff.lat), lng: Number(dropoff.lng) },
+      vehicle_category: vehicleType || undefined,
+    });
+    if (nqQuote && !nqQuote.error && Number.isFinite(Number(nqQuote.quoted_price))) {
+      return {
+        fare: Number(nqQuote.quoted_price),
+        currency: nqQuote.currency || "EUR",
+        etaMinutes: Number(nqQuote.eta_minutes || 0),
+        distanceKm: Number(nqQuote.distance_km || 0),
+        source: "nq_quote",
+      };
+    }
+  }
+
+  const metrics = estimateTripMetrics(Number(pickup.lat), Number(pickup.lng), Number(dropoff.lat), Number(dropoff.lng));
+  const fallback = estimateFallbackFare({
+    passengers: callState.passengers,
+    distanceKm: metrics.distanceKm,
+    timeMin: metrics.timeMin,
+    vehicleType: vehicleType || (callState.passengers > 4 ? "van" : "standard"),
+  });
+  return {
+    fare: fallback.estimatedFareEur,
+    currency: "EUR",
+    etaMinutes: Number(metrics.timeMin.toFixed(0)),
+    distanceKm: Number(metrics.distanceKm.toFixed(1)),
+    source: "fallback",
+  };
+}
+
+function summarizeRideForSpeech(callState) {
+  const whenText = callState.bookingFor === "later"
+    ? `${callState.scheduledDate || ""} ${callState.scheduledTime || ""}`.trim()
+    : "now";
+  return [
+    `Island ${callState.island}.`,
+    `Pickup ${callState.pickupLabel || callState.pickupRaw}.`,
+    `Dropoff ${callState.dropoffRaw}.`,
+    `Passengers ${callState.passengers || 1}.`,
+    `Time ${whenText}.`,
+  ].join(" ");
+}
+
 wss.on("connection", (vonageWs, req) => {
   const url = new URL(req.url, "http://localhost");
   const uuid = url.searchParams.get("uuid") || crypto.randomUUID();
   const from = url.searchParams.get("from") || "";
   const to = url.searchParams.get("to") || "";
 
-  if (!OPENAI_API_KEY) {
+  if (VOICE_STACK_MODE === "legacy_openai_realtime" && !OPENAI_API_KEY) {
     shutdown("missing_openai_key", vonageWs, null, null);
+    return;
+  }
+  if (VOICE_STACK_MODE === "deepgram_elevenlabs_fsm" && (!DEEPGRAM_API_KEY || !ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID)) {
+    shutdown("missing_deepgram_or_elevenlabs_key", vonageWs, null, null);
     return;
   }
 
@@ -2361,6 +2623,415 @@ wss.on("connection", (vonageWs, req) => {
     },
   };
   callRegistry.set(uuid, callState);
+
+  if (VOICE_STACK_MODE === "deepgram_elevenlabs_fsm") {
+    console.log("voice_stack_call_start", {
+      uuid,
+      stack: VOICE_STACK_MODE,
+      deepgramModel: DEEPGRAM_MODEL,
+      elevenVoiceId: ELEVENLABS_VOICE_ID || "missing",
+    });
+
+    let callClosed = false;
+    let awaitingUserReply = false;
+    let activeStage = "ask_island";
+    let pendingLaterText = "";
+    let retryPickup = 0;
+    let retryDropoff = 0;
+    let responseTimer = null;
+    let deepgramReady = false;
+    let deepgramFinalParts = [];
+    let lastCallerAt = Date.now();
+
+    const deepgramWs = new WebSocket(deepgramListenUrl(), {
+      headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
+    });
+
+    const deepgramKeepAlive = setInterval(() => {
+      if (deepgramWs.readyState !== WebSocket.OPEN) return;
+      try {
+        deepgramWs.send(JSON.stringify({ type: "KeepAlive" }));
+      } catch {}
+    }, 8000);
+
+    let speechChain = Promise.resolve();
+    let utteranceChain = Promise.resolve();
+
+    function clearResponseTimer() {
+      if (responseTimer) {
+        clearTimeout(responseTimer);
+        responseTimer = null;
+      }
+    }
+
+    function armResponseTimer() {
+      clearResponseTimer();
+      responseTimer = setTimeout(() => {
+        if (callClosed || !awaitingUserReply) return;
+        void scheduleSpeak(
+          "I did not hear a response. Please call us again when ready. Goodbye.",
+          false
+        ).then(() => closeCall("caller_timeout"));
+      }, CALL_RESPONSE_TIMEOUT_MS);
+    }
+
+    function closeCall(label) {
+      if (callClosed) return;
+      callClosed = true;
+      clearResponseTimer();
+      clearInterval(deepgramKeepAlive);
+      shutdown(label, vonageWs, deepgramWs, callState);
+      callRegistry.delete(uuid);
+    }
+
+    async function scheduleSpeak(text, waitForReply = true) {
+      const line = String(text || "").trim();
+      if (!line || callClosed) return;
+      speechChain = speechChain.then(async () => {
+        if (callClosed) return;
+        awaitingUserReply = false;
+        clearResponseTimer();
+        callState.transcripts.push({ at: nowIso(), speaker: "assistant", text: line });
+        if (callState.transcripts.length > 200) callState.transcripts = callState.transcripts.slice(-200);
+        void sinkTranscriptToNq(callState, "assistant", line);
+        const tts = await elevenLabsSynthesizePcm(line);
+        if (tts?.error || !tts?.pcm?.length) {
+          console.log("elevenlabs_tts_error", {
+            uuid,
+            error: tts?.error || "unknown",
+            message: tts?.message || "",
+          });
+          closeCall("elevenlabs_tts_error");
+          return;
+        }
+        await streamPcm16ToVonage(vonageWs, tts.pcm);
+        if (!callClosed && waitForReply) {
+          awaitingUserReply = true;
+          armResponseTimer();
+        }
+      });
+      return speechChain;
+    }
+
+    async function askHumanOrEnd(reasonCode, reasonPrompt) {
+      callState.handover = {
+        reason: reasonCode,
+        summary: summarizeRideForSpeech(callState),
+        at: nowIso(),
+      };
+      activeStage = "ask_human";
+      await scheduleSpeak(`${reasonPrompt} Do you want a human agent?`, true);
+    }
+
+    async function resolveAndValidate(kind, rawText) {
+      const { result, waypoint } = await resolveWaypointForCall(callState, kind, rawText);
+      if (waypoint) return { ok: true, result, waypoint };
+      if (kind === "pickup") callState.resolveFailures += 1;
+      if (kind === "dropoff") callState.resolveFailures += 1;
+      return { ok: false, result };
+    }
+
+    async function createBookingFromState() {
+      const pickup = waypointCoords(callState.pickupWaypoint);
+      const dropoff = waypointCoords(callState.dropoffWaypoint);
+      const parsedPickupTime = normalizeScheduledPickup({
+        booking_for: callState.bookingFor,
+        pickup_time: callState.pickupTime,
+        pickup_date: callState.scheduledDate,
+        pickup_clock: callState.scheduledTime,
+      }, callState.startedAt);
+      if (parsedPickupTime.mode === "later" && (!parsedPickupTime.ok || parsedPickupTime.needsClarification)) {
+        return { error: "pickup_time_needs_clarification" };
+      }
+      const combinedNotes = buildTransportNotes(callState) || undefined;
+      const nqVehicleCategoryName = await resolveNqVehicleCategoryName(
+        callState,
+        callState.vehicleTypePreference,
+        callState.passengers
+      );
+      const payload = clean({
+        customer_name: callState.name || undefined,
+        customer_phone: callState.phone || undefined,
+        pickup: {
+          lat: Number(pickup.lat),
+          lng: Number(pickup.lng),
+          address: callState.pickupLabel || callState.pickupRaw || undefined,
+        },
+        dropoff: {
+          lat: Number(dropoff.lat),
+          lng: Number(dropoff.lng),
+          address: callState.dropoffRaw || undefined,
+        },
+        notes: combinedNotes,
+        passenger_count: callState.passengers || 1,
+        scheduled_at: parsedPickupTime.mode === "later" ? parsedPickupTime.iso : undefined,
+        vehicle_category_name: nqVehicleCategoryName,
+      });
+      return nqCreateOrder(callState, payload);
+    }
+
+    async function processCallerUtterance(transcript) {
+      if (callClosed || !awaitingUserReply) return;
+      const text = String(transcript || "").trim();
+      if (!text) return;
+      lastCallerAt = Date.now();
+      callState.turnCount += 1;
+      callState.transcripts.push({ at: nowIso(), speaker: "caller", text });
+      if (callState.transcripts.length > 200) callState.transcripts = callState.transcripts.slice(-200);
+      void sinkTranscriptToNq(callState, "caller", text);
+      console.log("stt_transcript", { uuid, transcript: text, stage: activeStage });
+
+      const noAgent = detectExplicitNoAgent(text);
+      const wantsHuman = detectHumanEscalationIntent(text) && !noAgent;
+      if (wantsHuman && activeStage !== "ask_human") {
+        callState.handover = { reason: "requested_human", summary: text, at: nowIso() };
+        await scheduleSpeak("I will transfer this to a human agent now. Goodbye.", false);
+        closeCall("human_requested");
+        return;
+      }
+
+      if (activeStage === "ask_human") {
+        const yn = detectYesNo(text);
+        if (yn === "yes") {
+          await scheduleSpeak("I will transfer this to a human agent now. Goodbye.", false);
+          closeCall("handover_requested");
+          return;
+        }
+        await scheduleSpeak("Understood. I will end this call now. Goodbye.", false);
+        closeCall("end_call_no_human");
+        return;
+      }
+
+      if (activeStage === "ask_island") {
+        const areaId = detectAreaIdInText(text);
+        const area = areaId ? POI_DB.byId.get(areaId) : null;
+        if (!area?.name) {
+          await scheduleSpeak("Which island is the booking for?", true);
+          return;
+        }
+        if (!SUPPORTED_AREAS.includes(area.name)) {
+          await scheduleSpeak("Unfortunately we do not operate in that area. Goodbye.", false);
+          closeCall("unsupported_island");
+          return;
+        }
+        callState.island = area.name;
+        activeStage = "ask_now_later";
+        await scheduleSpeak(`Great. Booking for ${callState.island}. Is this for now or later?`, true);
+        return;
+      }
+
+      if (activeStage === "ask_now_later") {
+        const mode = detectNowLater(text);
+        if (mode === "unknown") {
+          await scheduleSpeak("Please say now or later.", true);
+          return;
+        }
+        callState.bookingFor = mode;
+        if (mode === "now") {
+          callState.pickupTime = "now";
+          activeStage = "ask_pickup";
+          await scheduleSpeak("What is your pickup location?", true);
+          return;
+        }
+        activeStage = "ask_later_time";
+        await scheduleSpeak("Please tell me date and time.", true);
+        return;
+      }
+
+      if (activeStage === "ask_later_time" || activeStage === "ask_later_time_clarify") {
+        const candidate = activeStage === "ask_later_time_clarify" ? `${pendingLaterText} ${text}` : text;
+        const parsed = normalizeScheduledPickup(
+          { booking_for: "later", pickup_time: candidate },
+          callState.startedAt
+        );
+        if (!parsed.ok) {
+          if (parsed.reason === "ambiguous_hour_needs_am_pm") {
+            pendingLaterText = candidate;
+            activeStage = "ask_later_time_clarify";
+            await scheduleSpeak("Is that AM or PM?", true);
+            return;
+          }
+          await scheduleSpeak("Please say date and time like tomorrow five PM.", true);
+          return;
+        }
+        callState.pickupTime = parsed.iso;
+        callState.scheduledDate = parsed.localDate;
+        callState.scheduledTime = parsed.localTime;
+        activeStage = "ask_pickup";
+        await scheduleSpeak("What is your pickup location?", true);
+        return;
+      }
+
+      if (activeStage === "ask_pickup") {
+        const resolved = await resolveAndValidate("pickup", text);
+        if (!resolved.ok) {
+          retryPickup += 1;
+          if (retryPickup >= 2) {
+            await askHumanOrEnd(
+              "pickup_not_found",
+              "I still could not find your pickup location."
+            );
+            return;
+          }
+          await scheduleSpeak("I could not find pickup. Please spell it slowly.", true);
+          return;
+        }
+        retryPickup = 0;
+        activeStage = "ask_dropoff";
+        await scheduleSpeak("What is your dropoff location?", true);
+        return;
+      }
+
+      if (activeStage === "ask_dropoff") {
+        const resolved = await resolveAndValidate("dropoff", text);
+        if (!resolved.ok) {
+          retryDropoff += 1;
+          if (retryDropoff >= 2) {
+            await askHumanOrEnd(
+              "dropoff_not_found",
+              "I still could not find your dropoff location."
+            );
+            return;
+          }
+          await scheduleSpeak("I could not find dropoff. Please spell it slowly.", true);
+          return;
+        }
+        retryDropoff = 0;
+        activeStage = "ask_passengers";
+        await scheduleSpeak("How many passengers?", true);
+        return;
+      }
+
+      if (activeStage === "ask_passengers") {
+        const pax = parsePassengerCountFromText(text);
+        if (!pax) {
+          await scheduleSpeak("Please tell me number of passengers.", true);
+          return;
+        }
+        callState.passengers = Math.max(1, pax);
+        callState.passengersCaptured = true;
+        callState.vehicleTypePreference = callState.passengers > 4 ? "van" : "standard";
+        activeStage = "ask_name";
+        await scheduleSpeak("What name should I use for this booking?", true);
+        return;
+      }
+
+      if (activeStage === "ask_name") {
+        const candidate = String(text || "").replace(/[^\p{L}\p{N}\s.'-]/gu, " ").trim();
+        if (candidate.length < 2) {
+          await scheduleSpeak("Please repeat the name for the booking.", true);
+          return;
+        }
+        callState.name = candidate;
+        callState.nameCaptured = true;
+        callState.intent = detectPriceIntent(text) ? "price_check" : "booking";
+        const quote = await buildQuoteFromState(callState);
+        if (quote?.error) {
+          callState.quoteFailures += 1;
+          await askHumanOrEnd(
+            "quote_failed",
+            "I could not calculate the price right now."
+          );
+          return;
+        }
+        callState.lastTariffs = quote;
+        activeStage = "confirm_booking";
+        await scheduleSpeak(
+          `${summarizeRideForSpeech(callState)} The price is about ${quote.fare} euros. Do you want me to submit this booking now?`,
+          true
+        );
+        return;
+      }
+
+      if (activeStage === "confirm_booking") {
+        const yn = detectYesNo(text);
+        if (yn === "unknown") {
+          await scheduleSpeak("Please say yes to book, or no to stop.", true);
+          return;
+        }
+        if (yn === "no") {
+          await scheduleSpeak("Understood. No booking was submitted. Goodbye.", false);
+          closeCall("price_only_no_booking");
+          return;
+        }
+        const result = await createBookingFromState();
+        const orderId = extractOrderId(result);
+        if (!orderId) {
+          callState.bookingFailures += 1;
+          await askHumanOrEnd(
+            "create_booking_failed",
+            "I could not submit the booking."
+          );
+          return;
+        }
+        callState.orderId = orderId;
+        rememberOrderForPhone(callState.phone, {
+          orderId,
+          island: callState.island,
+          pickupLabel: callState.pickupLabel || callState.pickupRaw,
+          dropoffLabel: callState.dropoffRaw,
+        });
+        const waPhone = normalizePhoneE164(callState.phone);
+        if (waPhone) {
+          const waText = `Aegean Taxi booking confirmed. Order ID ${orderId}.`;
+          const waRes = await sendWhatsapp({ phone: waPhone, message: waText, booking_id: orderId, channel: "voice_ai_v1" });
+          callState.whatsappStatus = {
+            sent: Boolean(waRes && !waRes.error && !waRes.skipped),
+            reason: waRes?.reason || "",
+          };
+        }
+        await scheduleSpeak(`Booking confirmed. Your order id is ${orderId}. Thank you for calling Aegean Taxi. Goodbye.`, false);
+        closeCall("booking_completed");
+      }
+    }
+
+    deepgramWs.on("open", () => {
+      deepgramReady = true;
+      console.log("deepgram_ws_open", { uuid, model: DEEPGRAM_MODEL, language: DEEPGRAM_LANGUAGE });
+      void scheduleSpeak(`${GREETING_TEXT} Which island is the booking for?`, true);
+    });
+
+    deepgramWs.on("message", (raw) => {
+      if (callClosed) return;
+      const evt = safeJsonParse(raw.toString());
+      if (!evt || evt.type !== "Results") return;
+      const transcript = String(evt?.channel?.alternatives?.[0]?.transcript || "").trim();
+      if (evt.is_final && transcript) deepgramFinalParts.push(transcript);
+      if (!evt.speech_final) return;
+      const merged = deepgramFinalParts.join(" ").trim() || transcript;
+      deepgramFinalParts = [];
+      if (!merged) return;
+      utteranceChain = utteranceChain
+        .then(() => processCallerUtterance(merged))
+        .catch((err) => {
+          console.log("fsm_process_error", { uuid, message: err?.message || String(err) });
+          closeCall("fsm_process_error");
+        });
+    });
+
+    deepgramWs.on("close", (code, reason) => {
+      console.log("deepgram_ws_closed", { uuid, code, reason: reason?.toString?.() || "" });
+      closeCall("deepgram_ws_closed");
+    });
+
+    deepgramWs.on("error", (err) => {
+      console.log("deepgram_ws_error", { uuid, message: err?.message || String(err) });
+      closeCall("deepgram_ws_error");
+    });
+
+    vonageWs.on("message", (msg) => {
+      if (!deepgramReady || callClosed) return;
+      if (typeof msg === "string") return;
+      if (deepgramWs.readyState !== WebSocket.OPEN) return;
+      try {
+        deepgramWs.send(Buffer.from(msg));
+      } catch {}
+    });
+
+    vonageWs.on("close", () => closeCall("vonage_ws_closed"));
+    vonageWs.on("error", () => closeCall("vonage_ws_error"));
+    return;
+  }
 
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_MODEL)}`,
@@ -3413,6 +4084,11 @@ server.listen(PORT, () => {
   console.log(`openai_model=${OPENAI_REALTIME_MODEL}`);
   console.log(`openai_voice=${OPENAI_VOICE}`);
   console.log(`openai_stt_model=${OPENAI_STT_MODEL}`);
+  console.log(`voice_stack_mode=${VOICE_STACK_MODE}`);
+  console.log(`deepgram_model=${DEEPGRAM_MODEL}`);
+  console.log(`deepgram_configured=${Boolean(DEEPGRAM_API_KEY)}`);
+  console.log(`elevenlabs_voice_id=${ELEVENLABS_VOICE_ID || "not_set"}`);
+  console.log(`elevenlabs_configured=${Boolean(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID)}`);
   console.log(`onde_mode_disabled=true`);
   console.log(`nq_base_url=${NQ_BASE_URL || "not_set"}`);
   console.log(`nq_configured=${Boolean(NQ_BASE_URL && NQ_SERVICE_TOKEN)}`);
