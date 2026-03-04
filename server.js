@@ -106,6 +106,12 @@ const ELEVENLABS_BASE_URL = (String(process.env.ELEVENLABS_BASE_URL || "https://
 const ELEVENLABS_OUTPUT_FORMAT = String(process.env.ELEVENLABS_OUTPUT_FORMAT || "pcm_16000").trim();
 const ELEVENLABS_TTS_TIMEOUT_MS = Math.max(1500, Number(process.env.ELEVENLABS_TTS_TIMEOUT_MS || 9000));
 const CALL_RESPONSE_TIMEOUT_MS = Math.max(20000, Number(process.env.CALL_RESPONSE_TIMEOUT_MS || 45000));
+const FSM_INITIAL_PROMPT = (
+  process.env.FSM_INITIAL_PROMPT || "Welcome to Aegean Taxi. Which island is the booking for?"
+).trim();
+const DEEPGRAM_TTS_BASE_URL = (String(process.env.DEEPGRAM_TTS_BASE_URL || "https://api.deepgram.com") || "").replace(/\/+$/, "");
+const DEEPGRAM_TTS_MODEL = String(process.env.DEEPGRAM_TTS_MODEL || "aura-2-thalia-en").trim();
+const DEEPGRAM_TTS_TIMEOUT_MS = Math.max(1500, Number(process.env.DEEPGRAM_TTS_TIMEOUT_MS || 9000));
 
 const VONAGE_SAMPLE_RATE = 16000;
 const OPENAI_SAMPLE_RATE = 24000;
@@ -2551,6 +2557,48 @@ async function elevenLabsSynthesizePcm(text) {
   }
 }
 
+async function deepgramSynthesizePcm(text) {
+  if (!DEEPGRAM_API_KEY || !DEEPGRAM_TTS_BASE_URL || !DEEPGRAM_TTS_MODEL) {
+    return { error: "deepgram_tts_not_configured" };
+  }
+  const payload = { text: String(text || "").trim() };
+  if (!payload.text) return { error: "missing_tts_text" };
+  const url =
+    `${DEEPGRAM_TTS_BASE_URL}/v1/speak` +
+    `?model=${encodeURIComponent(DEEPGRAM_TTS_MODEL)}` +
+    `&encoding=linear16&sample_rate=${encodeURIComponent(String(VONAGE_SAMPLE_RATE))}` +
+    `&container=none`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DEEPGRAM_TTS_TIMEOUT_MS);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${DEEPGRAM_API_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/octet-stream",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return {
+        error: "deepgram_tts_failed",
+        status: resp.status,
+        message: errText.slice(0, 220),
+      };
+    }
+    const ab = await resp.arrayBuffer();
+    const pcm = Buffer.from(ab);
+    if (!pcm.length) return { error: "deepgram_tts_empty_audio" };
+    return { pcm };
+  } catch (err) {
+    return { error: "deepgram_tts_failed", message: err?.message || String(err) };
+  }
+}
+
 async function streamPcm16ToVonage(vonageWs, pcm) {
   if (!pcm || !pcm.length) return;
   const chunkBytes = 640; // 20ms @ 16kHz mono PCM16
@@ -2587,6 +2635,7 @@ async function resolveWaypointForCall(callState, kind, query) {
   } else {
     callState.dropoffWaypoint = wp;
     callState.dropoffRaw = query;
+    callState.dropoffLabel = result?.best?.label || wp?.poiName || wp?.premise || query;
   }
   return { result, waypoint: wp };
 }
@@ -2640,7 +2689,7 @@ function summarizeRideForSpeech(callState) {
   return [
     `Island ${callState.island}.`,
     `Pickup ${callState.pickupLabel || callState.pickupRaw}.`,
-    `Dropoff ${callState.dropoffRaw}.`,
+    `Dropoff ${callState.dropoffLabel || callState.dropoffRaw}.`,
     `Passengers ${callState.passengers || 1}.`,
     `Time ${whenText}.`,
   ].join(" ");
@@ -2688,6 +2737,7 @@ wss.on("connection", (vonageWs, req) => {
     pickupMode: "other",
     pickupType: "",
     pickupLabel: "",
+    dropoffLabel: "",
     numberId: NQ_CALL_NUMBER_ID || "",
     companyId: NQ_COMPANY_ID || "",
     companyCode: NQ_COMPANY_CODE || "",
@@ -2763,6 +2813,7 @@ wss.on("connection", (vonageWs, req) => {
 
     let speechChain = Promise.resolve();
     let utteranceChain = Promise.resolve();
+    let ttsProvider = "elevenlabs";
 
     function clearResponseTimer() {
       if (responseTimer) {
@@ -2801,14 +2852,48 @@ wss.on("connection", (vonageWs, req) => {
         callState.transcripts.push({ at: nowIso(), speaker: "assistant", text: line });
         if (callState.transcripts.length > 200) callState.transcripts = callState.transcripts.slice(-200);
         void sinkTranscriptToNq(callState, "assistant", line);
-        const tts = await elevenLabsSynthesizePcm(line);
+        let tts = null;
+        if (ttsProvider === "deepgram") {
+          tts = await deepgramSynthesizePcm(line);
+          if (!tts?.error && tts?.pcm?.length) tts.provider = "deepgram";
+        } else {
+          tts = await elevenLabsSynthesizePcm(line);
+          if (!tts?.error && tts?.pcm?.length) {
+            tts.provider = "elevenlabs";
+          } else {
+            const msg = String(tts?.message || "").toLowerCase();
+            const status = Number(tts?.status || 0);
+            const shouldSwitch = msg.includes("quota_exceeded") || status === 402 || status === 429;
+            if (shouldSwitch) {
+              ttsProvider = "deepgram";
+              console.log("tts_provider_switch", {
+                uuid,
+                from: "elevenlabs",
+                to: "deepgram",
+                reason: "elevenlabs_quota_or_rate_limit",
+                status,
+                error: tts?.error || "unknown",
+              });
+            }
+            const fallback = await deepgramSynthesizePcm(line);
+            if (!fallback?.error && fallback?.pcm?.length) {
+              tts = { ...fallback, provider: "deepgram_fallback" };
+            } else {
+              tts = {
+                error: "tts_both_failed",
+                message: `elevenlabs=${tts?.error || "unknown"} deepgram=${fallback?.error || "unknown"}`,
+              };
+            }
+          }
+        }
         if (tts?.error || !tts?.pcm?.length) {
-          console.log("elevenlabs_tts_error", {
+          console.log("tts_error", {
             uuid,
+            provider: ttsProvider,
             error: tts?.error || "unknown",
             message: tts?.message || "",
           });
-          closeCall("elevenlabs_tts_error");
+          closeCall("tts_error");
           return;
         }
         await streamPcm16ToVonage(vonageWs, tts.pcm);
@@ -2875,7 +2960,7 @@ wss.on("connection", (vonageWs, req) => {
         dropoff: {
           lat: Number(dropoff.lat),
           lng: Number(dropoff.lng),
-          address: callState.dropoffRaw || undefined,
+          address: callState.dropoffLabel || callState.dropoffRaw || undefined,
         },
         notes: combinedNotes,
         passenger_count: callState.passengers || 1,
@@ -3079,7 +3164,7 @@ wss.on("connection", (vonageWs, req) => {
         }
         retryDropoff = 0;
         activeStage = "confirm_dropoff";
-        await scheduleSpeak(`I understood dropoff as ${callState.dropoffRaw}. Is that correct?`, true);
+        await scheduleSpeak(`I understood dropoff as ${callState.dropoffLabel || callState.dropoffRaw}. Is that correct?`, true);
         return;
       }
 
@@ -3093,6 +3178,7 @@ wss.on("connection", (vonageWs, req) => {
         if (yn === "no") {
           callState.dropoffWaypoint = null;
           callState.dropoffRaw = "";
+          callState.dropoffLabel = "";
           retryDropoff += 1;
           if (retryDropoff >= 2) {
             await askHumanOrEnd(
@@ -3187,7 +3273,7 @@ wss.on("connection", (vonageWs, req) => {
           orderId,
           island: callState.island,
           pickupLabel: callState.pickupLabel || callState.pickupRaw,
-          dropoffLabel: callState.dropoffRaw,
+          dropoffLabel: callState.dropoffLabel || callState.dropoffRaw,
         });
         const waPhone = normalizePhoneE164(callState.phone);
         if (waPhone) {
@@ -3217,12 +3303,8 @@ wss.on("connection", (vonageWs, req) => {
     deepgramWs.on("open", () => {
       deepgramReady = true;
       console.log("deepgram_ws_open", { uuid, model: DEEPGRAM_MODEL, language: DEEPGRAM_LANGUAGE });
-      const greetingOnly = String(GREETING_TEXT || "Welcome to Aegean Taxi.")
-        .replace(/\?.*$/s, "")
-        .trim() || "Welcome to Aegean Taxi.";
       void (async () => {
-        await scheduleSpeak(greetingOnly, false);
-        await scheduleSpeak("Which island is the booking for?", true);
+        await scheduleSpeak(FSM_INITIAL_PROMPT, true);
       })();
     });
 
